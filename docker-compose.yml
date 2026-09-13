@@ -1,0 +1,19 @@
+# Conveniência para build local (`docker compose build`) e testes manuais
+# (`docker compose run --rm f5-mcp-agent`). A integração real com Claude Desktop/Code
+# roda o container via stdio diretamente (veja README.md) — compose não é necessário
+# para isso, mas ajuda a padronizar os volumes/env durante o desenvolvimento.
+services:
+  f5-mcp-agent:
+    build: .
+    image: f5-mcp-agent:latest
+    env_file:
+      - .env
+    volumes:
+      - ./inventory.yaml:/app/inventory.yaml:ro
+      - ./data:/app/data:ro
+      # Descomente se usar Google Sheets:
+      # - ./google-creds.json:/app/google-creds.json:ro
+      # Necessário para paramiko.RejectPolicy (verificação de host key):
+      # - ./known_hosts:/root/.ssh/known_hosts:ro
+    stdin_open: true
+    tty: false

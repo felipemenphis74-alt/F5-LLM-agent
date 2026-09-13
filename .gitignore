@@ -1,0 +1,8 @@
+.env
+inventory.yaml
+google-creds.json
+known_hosts
+data/*.xlsx
+data/*.xls
+__pycache__/
+*.pyc

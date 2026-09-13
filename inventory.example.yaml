@@ -1,0 +1,36 @@
+# Copie para inventory.yaml (NÃO versionar em git — contém topologia interna) e ajuste.
+# Cada device referencia variáveis de ambiente para usuário/senha (definidas no .env),
+# nunca coloque credenciais em texto puro aqui.
+#
+# auth_env define o NOME das variáveis de ambiente que contêm usuário/senha/chave
+# para este device — permite reutilizar o mesmo par de credenciais em vários F5,
+# ou usar um par diferente por device.
+
+devices:
+  - name: f5-prod-01
+    host: 10.10.10.11
+    port: 22
+    partition: Common
+    auth_env:
+      user: F5_PROD01_USER
+      password: F5_PROD01_PASSWORD     # opcional se usar key_env
+      key_env: null                    # ex: F5_PROD01_SSH_KEY_PATH (caminho montado no container)
+    tags: [producao, datacenter-a]
+
+  - name: f5-prod-02
+    host: 10.10.10.12
+    port: 22
+    partition: Common
+    auth_env:
+      user: F5_PROD02_USER
+      password: F5_PROD02_PASSWORD
+      key_env: null
+    tags: [producao, datacenter-b]
+
+# Timeouts e limites de segurança aplicados a TODOS os devices (podem ser sobrescritos
+# por variável de ambiente global, ver .env.example)
+defaults:
+  ssh_connect_timeout_sec: 10
+  command_timeout_sec: 20
+  tcpdump_max_count: 500          # limite duro de pacotes por captura (proteção de carga)
+  tcpdump_max_duration_sec: 60    # limite duro de duração por captura

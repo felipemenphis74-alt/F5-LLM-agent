@@ -1,0 +1,11 @@
+# Pinned to the 1.x line: FastMCP's stable, documented API. mcp>=2.0 renamed
+# FastMCP -> MCPServer with a different constructor/decorator surface; revisit this
+# pin deliberately if you want to move to 2.x.
+mcp>=1.2.0,<2.0.0
+paramiko>=3.4.0
+pandas>=2.2.0
+openpyxl>=3.1.2
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+google-api-python-client>=2.126.0
+google-auth>=2.29.0
