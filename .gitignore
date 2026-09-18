@@ -1,5 +1,6 @@
 .env
 inventory.yaml
+.mcp.json
 google-creds.json
 known_hosts
 data/*.xlsx
