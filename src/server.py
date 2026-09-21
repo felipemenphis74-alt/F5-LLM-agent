@@ -14,7 +14,13 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from . import baseline_excel, baseline_sheets, comparator, tmsh_parser, tcpdump_parser
-from .f5_client import F5Client, F5ConnectionError, TCPDUMP_BUSY_RETRY_MINUTES, TcpdumpBusyError
+from .f5_client import (
+    F5Client,
+    F5ConnectionError,
+    TCPDUMP_BUSY_RETRY_MINUTES,
+    TcpdumpBusyError,
+    describe_tcpdump_warnings,
+)
 from .inventory import Inventory, InventoryError
 from .safety import UnsafeInputError
 
@@ -212,9 +218,13 @@ def tcpdump_validate_traffic(
     timeout duro (definidos no inventory.yaml) para nunca impactar o equipamento.
 
     Antes de iniciar, o agente confere quantas capturas tcpdump já estão rodando no
-    host; se houver mais que o limite (padrão: 2), ele RECUSA iniciar uma nova — nunca
-    interrompe ou altera capturas em andamento — e retorna status 'busy' pedindo para
-    tentar de novo em alguns minutos.
+    host; se isso já estiver no limite (padrão: 2 — contando a que seria iniciada
+    agora), ele RECUSA iniciar uma nova — nunca interrompe ou altera capturas em
+    andamento — e retorna status 'busy' pedindo para tentar de novo em alguns
+    minutos. Mesmo quando a captura roda, o campo 'warnings' do retorno reporta
+    qualquer aviso do próprio TMOS sobre concorrência de tcpdump (ex: limite de
+    instâncias tmm excedido) que apareça no stderr — cobre o caso raro de outra
+    captura começar bem entre o check e o início desta.
 
     Requer que a conta SSH tenha 'Advanced shell (bash)' habilitado no BIG-IP (tcpdump
     não roda dentro do prompt tmsh)."""
@@ -248,6 +258,10 @@ def tcpdump_validate_traffic(
         "packets": packets[:200],
         "packet_count_truncated": len(packets) > 200,
         "stderr": result.stderr,
+        # Avisos do próprio TMOS sobre concorrência de tcpdump detectados no stderr
+        # desta execução (ex: limite de instâncias tmm excedido) — destacados aqui em
+        # vez de ficarem enterrados no stderr bruto acima.
+        "warnings": describe_tcpdump_warnings(result.stderr),
     }
 
 

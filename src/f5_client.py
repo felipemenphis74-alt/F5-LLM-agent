@@ -23,13 +23,37 @@ from .safety import (
     require_port,
 )
 
-# Nº máximo de capturas tcpdump que podem estar rodando simultaneamente no F5 antes
-# do agente recusar iniciar mais uma (guarda de carga). O agente NUNCA interrompe ou
-# altera capturas já em execução — só decide não empilhar mais uma em cima.
+# Teto de capturas tcpdump TOTAL simultâneas no F5, contando a que o agente está
+# prestes a iniciar. Ou seja: se já houver >= MAX_CONCURRENT_TCPDUMP rodando, o
+# agente recusa iniciar mais uma (senão o total passaria do teto). O agente NUNCA
+# interrompe ou altera capturas já em execução — só decide não empilhar mais uma.
 MAX_CONCURRENT_TCPDUMP = 2
 
 # Retry sugerido ao usuário quando a captura é recusada por excesso de concorrência.
 TCPDUMP_BUSY_RETRY_MINUTES = 5
+
+# Trecho que o próprio TMOS imprime no stderr do tcpdump quando o número de capturas
+# tmm concorrentes passa do recomendado. Pode aparecer mesmo com o nosso check antes
+# (corrida entre o check e o tcpdump começar de fato — o TMM pode contar de forma
+# diferente de processos tcpdump em userland/`ps`). Quando aparece, é reportado como
+# warning explícito pro chamador, mesmo que a captura em si tenha rodado.
+TMM_TCPDUMP_WARNING_MARKER = "tmm tcpdump instances"
+
+
+def describe_tcpdump_warnings(stderr: str) -> list[str]:
+    """Varre o stderr de uma captura já executada por avisos conhecidos do próprio
+    TMOS sobre concorrência de tcpdump, para reportar explicitamente ao chamador em
+    vez de deixar enterrado no stderr bruto."""
+    warnings = []
+    if TMM_TCPDUMP_WARNING_MARKER in stderr:
+        for line in stderr.splitlines():
+            if TMM_TCPDUMP_WARNING_MARKER in line:
+                warnings.append(
+                    f"O F5 reportou concorrência de tcpdump acima do recomendado "
+                    f"durante esta captura: {line.strip()!r}. Considere aguardar "
+                    f"~{TCPDUMP_BUSY_RETRY_MINUTES} minutos antes de rodar outra."
+                )
+    return warnings
 
 
 @dataclass
@@ -205,16 +229,19 @@ class F5Client:
         if host is not None:
             require_identifier(host, "host")
 
-        # Guarda de concorrência: nunca empilha uma captura em cima de outras que já
-        # possam estar rodando (de outro operador, outro chamado deste agente, etc.).
+        # Guarda de concorrência: nunca deixa o TOTAL de capturas simultâneas (as que
+        # já existem + esta que estamos prestes a iniciar) passar de
+        # MAX_CONCURRENT_TCPDUMP. Ou seja, recusa já a partir de
+        # `running >= MAX_CONCURRENT_TCPDUMP` — não espera passar do teto pra agir.
         # Não interrompe/altera nada que já esteja em execução — só recusa iniciar.
         running = self.count_running_tcpdump()
-        if running > MAX_CONCURRENT_TCPDUMP:
+        if running >= MAX_CONCURRENT_TCPDUMP:
             raise TcpdumpBusyError(
                 f"Já existem {running} captura(s) tcpdump em execução em "
-                f"{self.device.name} (limite: {MAX_CONCURRENT_TCPDUMP}). O agente não "
-                "inicia uma nova captura nem interrompe as existentes — tente "
-                f"novamente em ~{TCPDUMP_BUSY_RETRY_MINUTES} minutos."
+                f"{self.device.name} — iniciar mais uma passaria do teto de "
+                f"{MAX_CONCURRENT_TCPDUMP} simultâneas. O agente não inicia uma nova "
+                "captura nem interrompe as existentes — tente novamente em "
+                f"~{TCPDUMP_BUSY_RETRY_MINUTES} minutos."
             )
 
         port_filters = []
