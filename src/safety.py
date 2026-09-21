@@ -116,3 +116,21 @@ def assert_safe_tcpdump_command(command: str) -> str:
                 f"Comando tcpdump contém token proibido {token!r}: {normalized!r}"
             )
     return normalized
+
+
+# Comando fixo usado só para CONTAR processos tcpdump já em execução no host, como
+# guarda de concorrência antes de iniciar uma nova captura (nunca para checar mais
+# nada além disso, e nunca para matar/alterar processos existentes). Allowlist
+# fechada — sem interpolação de entrada externa, nunca aceita variação.
+ALLOWED_PS_COMMANDS = (
+    "ps -eo pid,comm",
+)
+
+
+def assert_safe_ps_command(command: str) -> str:
+    """Valida o comando fixo de listagem de processos usado para checar quantas
+    capturas tcpdump já estão rodando antes de iniciar uma nova."""
+    normalized = command.strip()
+    if normalized not in ALLOWED_PS_COMMANDS:
+        raise UnsafeInputError(f"Comando ps fora do esperado: {normalized!r}")
+    return normalized
