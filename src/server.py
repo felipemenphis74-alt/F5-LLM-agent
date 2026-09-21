@@ -14,7 +14,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from . import baseline_excel, baseline_sheets, comparator, tmsh_parser, tcpdump_parser
-from .f5_client import F5Client, F5ConnectionError
+from .f5_client import F5Client, F5ConnectionError, TCPDUMP_BUSY_RETRY_MINUTES, TcpdumpBusyError
 from .inventory import Inventory, InventoryError
 from .safety import UnsafeInputError
 
@@ -198,31 +198,50 @@ def tcpdump_validate_traffic(
     interface: str = "any",
     server_port: Optional[int] = None,
     node_port: Optional[int] = None,
+    host: Optional[str] = None,
     count: int = 100,
     timeout_sec: int = 20,
 ) -> dict:
     """Executa uma captura tcpdump somente-leitura no BIG-IP (via SSH, sem gravar
-    .pcap) filtrando por porta de servidor (VS) e/ou porta de node/pool member, e
-    analisa os pacotes capturados: identifica SYN, SYN+ACK, RST/RST+ACK, ACK, origem
-    de cada pacote, e procura os marcadores de payload '0800' (request) / '0810'
-    (resposta) — ajuste se o protocolo do cliente usar outra convenção. A captura é
-    limitada por --count e por timeout duro (definidos no inventory.yaml) para nunca
-    impactar o equipamento. Requer que a conta SSH tenha 'Advanced shell (bash)'
-    habilitado no BIG-IP (tcpdump não roda dentro do prompt tmsh)."""
+    .pcap) filtrando por porta de servidor (VS), porta de node/pool member e,
+    opcionalmente, por `host` (IP do pool member/node — afunila a captura a um device
+    específico em vez de qualquer tráfego na(s) porta(s), útil ao validar um pool). A
+    análise identifica SYN, SYN+ACK, RST/RST+ACK, ACK, origem de cada pacote, e procura
+    os marcadores de payload '0800' (request) / '0810' (resposta) — ajuste se o
+    protocolo do cliente usar outra convenção. A captura é limitada por --count e por
+    timeout duro (definidos no inventory.yaml) para nunca impactar o equipamento.
+
+    Antes de iniciar, o agente confere quantas capturas tcpdump já estão rodando no
+    host; se houver mais que o limite (padrão: 2), ele RECUSA iniciar uma nova — nunca
+    interrompe ou altera capturas em andamento — e retorna status 'busy' pedindo para
+    tentar de novo em alguns minutos.
+
+    Requer que a conta SSH tenha 'Advanced shell (bash)' habilitado no BIG-IP (tcpdump
+    não roda dentro do prompt tmsh)."""
     inv = _get_inventory()
     client = _client_for(device)
-    result = client.tcpdump_capture(
-        interface=interface,
-        server_port=server_port,
-        node_port=node_port,
-        count=count,
-        max_count=inv.limits.tcpdump_max_count,
-        timeout_sec=timeout_sec,
-        max_timeout_sec=inv.limits.tcpdump_max_duration_sec,
-    )
+    try:
+        result = client.tcpdump_capture(
+            interface=interface,
+            server_port=server_port,
+            node_port=node_port,
+            host=host,
+            count=count,
+            max_count=inv.limits.tcpdump_max_count,
+            timeout_sec=timeout_sec,
+            max_timeout_sec=inv.limits.tcpdump_max_duration_sec,
+        )
+    except TcpdumpBusyError as exc:
+        return {
+            "status": "busy",
+            "message": str(exc),
+            "retry_after_minutes": TCPDUMP_BUSY_RETRY_MINUTES,
+        }
+
     packets = tcpdump_parser.parse_tcpdump_output(result.stdout)
     summary = tcpdump_parser.summarize(packets)
     return {
+        "status": "ok",
         "command": result.command,
         "exit_status": result.exit_status,
         "summary": summary,

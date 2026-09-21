@@ -1,9 +1,9 @@
 """Cliente SSH read-only para BIG-IP (TMOS).
 
-Toda execução passa por safety.assert_safe_tmsh_command / assert_safe_tcpdump_command
-antes de ir para o wire. Nenhuma função aqui aceita comando livre vindo do chamador de
-fora deste módulo — os métodos públicos são parametrizados (nomes de VS, pool, etc.)
-e montam o comando internamente a partir de templates fixos.
+Toda execução passa por safety.assert_safe_tmsh_command / assert_safe_tcpdump_command /
+assert_safe_ps_command antes de ir para o wire. Nenhuma função aqui aceita comando
+livre vindo do chamador de fora deste módulo — os métodos públicos são parametrizados
+(nomes de VS, pool, etc.) e montam o comando internamente a partir de templates fixos.
 """
 from __future__ import annotations
 
@@ -16,11 +16,20 @@ import paramiko
 from .inventory import Device
 from .safety import (
     UnsafeInputError,
+    assert_safe_ps_command,
     assert_safe_tcpdump_command,
     assert_safe_tmsh_command,
     require_identifier,
     require_port,
 )
+
+# Nº máximo de capturas tcpdump que podem estar rodando simultaneamente no F5 antes
+# do agente recusar iniciar mais uma (guarda de carga). O agente NUNCA interrompe ou
+# altera capturas já em execução — só decide não empilhar mais uma em cima.
+MAX_CONCURRENT_TCPDUMP = 2
+
+# Retry sugerido ao usuário quando a captura é recusada por excesso de concorrência.
+TCPDUMP_BUSY_RETRY_MINUTES = 5
 
 
 @dataclass
@@ -33,6 +42,14 @@ class CommandResult:
 
 class F5ConnectionError(RuntimeError):
     pass
+
+
+class TcpdumpBusyError(RuntimeError):
+    """Levantado quando já existem capturas tcpdump demais em execução no host.
+
+    O agente nunca mata/altera capturas existentes — isso é só um freio para não
+    empilhar mais uma captura em cima de outras que já podem estar rodando (de
+    outro operador, outro chamado deste mesmo agente, etc.)."""
 
 
 class F5Client:
@@ -150,6 +167,23 @@ class F5Client:
 
     # ---- tcpdump (nativo do TMOS, somente captura/leitura) -----------------------
 
+    def count_running_tcpdump(self) -> int:
+        """Conta quantos processos `tcpdump` já estão rodando no host — sem alterar
+        ou finalizar nenhum deles. Usado como guarda de concorrência antes de iniciar
+        uma nova captura."""
+        result = self._run(assert_safe_ps_command("ps -eo pid,comm"))
+        count = 0
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # formato de "ps -eo pid,comm": "<pid> <comm>" — comm pode vir com path
+            # (ex: "/usr/sbin/tcpdump") dependendo da distro/versão do ps.
+            _, _, comm = line.partition(" ")
+            if "tcpdump" in comm.strip():
+                count += 1
+        return count
+
     def tcpdump_capture(
         self,
         interface: str,
@@ -159,6 +193,7 @@ class F5Client:
         max_count: int,
         timeout_sec: int,
         max_timeout_sec: int,
+        host: Optional[str] = None,
     ) -> CommandResult:
         require_identifier(interface, "interface")
         if count < 1 or count > max_count:
@@ -166,6 +201,20 @@ class F5Client:
         if timeout_sec < 1 or timeout_sec > max_timeout_sec:
             raise UnsafeInputError(
                 f"timeout_sec deve estar entre 1 e {max_timeout_sec} (recebido {timeout_sec})"
+            )
+        if host is not None:
+            require_identifier(host, "host")
+
+        # Guarda de concorrência: nunca empilha uma captura em cima de outras que já
+        # possam estar rodando (de outro operador, outro chamado deste agente, etc.).
+        # Não interrompe/altera nada que já esteja em execução — só recusa iniciar.
+        running = self.count_running_tcpdump()
+        if running > MAX_CONCURRENT_TCPDUMP:
+            raise TcpdumpBusyError(
+                f"Já existem {running} captura(s) tcpdump em execução em "
+                f"{self.device.name} (limite: {MAX_CONCURRENT_TCPDUMP}). O agente não "
+                "inicia uma nova captura nem interrompe as existentes — tente "
+                f"novamente em ~{TCPDUMP_BUSY_RETRY_MINUTES} minutos."
             )
 
         port_filters = []
@@ -176,7 +225,17 @@ class F5Client:
             require_port(node_port, "node_port")
             port_filters.append(f"port {int(node_port)}")
 
-        filter_expr = " or ".join(port_filters) if port_filters else ""
+        # Filtros de porta se combinam por OR entre si; o filtro de host (quando
+        # informado) sempre AND com o resto, para afunilar a captura a um device
+        # específico em vez de qualquer tráfego que passe pela(s) porta(s).
+        filter_terms = []
+        if port_filters:
+            filter_terms.append(
+                "(" + " or ".join(port_filters) + ")" if len(port_filters) > 1 else port_filters[0]
+            )
+        if host is not None:
+            filter_terms.append(f"host {shlex.quote(host)}")
+        filter_expr = " and ".join(filter_terms)
 
         # -nn: sem resolução de nomes/portas (mais rápido, sem depender de DNS)
         # -X: hex+ascii do payload, necessário para localizar marcadores 0800/0810
