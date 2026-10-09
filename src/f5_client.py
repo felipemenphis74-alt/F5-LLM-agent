@@ -19,6 +19,7 @@ from .safety import (
     assert_safe_ps_command,
     assert_safe_tcpdump_command,
     assert_safe_tmsh_command,
+    require_capturable_port,
     require_identifier,
     require_port,
 )
@@ -229,6 +230,17 @@ class F5Client:
         if host is not None:
             require_identifier(host, "host")
 
+        # Portas proibidas (safety.BLOCKED_TCPDUMP_PORTS, ex: 1222 = conexão com a
+        # captura RISe): recusadas AQUI, antes de qualquer conexão SSH — uma captura
+        # pedida explicitamente nessas portas nunca chega nem a consultar o F5.
+        port_filters = []
+        if server_port is not None:
+            require_capturable_port(server_port, "server_port")
+            port_filters.append(f"port {int(server_port)}")
+        if node_port is not None:
+            require_capturable_port(node_port, "node_port")
+            port_filters.append(f"port {int(node_port)}")
+
         # Guarda de concorrência: nunca deixa o TOTAL de capturas simultâneas (as que
         # já existem + esta que estamos prestes a iniciar) passar de
         # MAX_CONCURRENT_TCPDUMP. Ou seja, recusa já a partir de
@@ -243,14 +255,6 @@ class F5Client:
                 "captura nem interrompe as existentes — tente novamente em "
                 f"~{TCPDUMP_BUSY_RETRY_MINUTES} minutos."
             )
-
-        port_filters = []
-        if server_port is not None:
-            require_port(server_port, "server_port")
-            port_filters.append(f"port {int(server_port)}")
-        if node_port is not None:
-            require_port(node_port, "node_port")
-            port_filters.append(f"port {int(node_port)}")
 
         # Filtros de porta se combinam por OR entre si; o filtro de host (quando
         # informado) sempre AND com o resto, para afunilar a captura a um device
