@@ -1,22 +1,94 @@
 """Auto-teste rápido (sem F5 real) dos parsers e das camadas de segurança.
 Roda dentro do container: docker run --rm --entrypoint python f5-mcp-agent:test -m src._selftest
 """
-from . import tcpdump_parser, tmsh_parser, safety, comparator
+import socket
+import struct
 
-SAMPLE_TCPDUMP = """\
-14:01:02.100000 IP 10.1.1.5.51000 > 10.1.1.10.443: Flags [S], seq 1000, win 64240, length 0
-\t0x0000:  4500 0034 0000 4000 4006 0000 0a01 0105  E..4..@.@.......
-\t0x0010:  0a01 010a 010b 000f 0000 0000 0000 0000  ................
-14:01:02.100500 IP 10.1.1.10.443 > 10.1.1.5.51000: Flags [S.], seq 2000, ack 1001, win 65535, length 0
-\t0x0000:  4500 0034 0000 4000 4006 0000 0a01 010a  E..4..@.@.......
-14:01:02.101000 IP 10.1.1.5.51000 > 10.1.1.10.443: Flags [P.], seq 1001, ack 2001, win 502, length 20
-\t0x0000:  4500 0038 0000 4000 4006 0000 0a01 0105  E..8..@.@.......
-\t0x0010:  0a01 010a 010b 000f 0000 0000 0000 0000  ................
-\t0x0020:  3038 3030 3030 3030 3030 3030 3030 3030  0800000000000000
-14:01:02.150000 IP 10.1.1.10.443 > 10.1.1.5.51000: Flags [P.], seq 2001, ack 1021, win 65535, length 20
-\t0x0020:  3038 3130 3030 3030 3030 3030 3030 3030  0810000000000000
-14:01:02.200000 IP 10.1.1.10.443 > 10.1.1.5.51000: Flags [R.], seq 2021, ack 1021, win 0, length 0
-"""
+from . import tcpdump_parser, tmsh_parser, safety, comparator
+from .f5_client import CommandResult, F5Client
+from .inventory import Device, DeviceCredentials
+
+# ---------------------------------------------------------------------------
+# Geração de capturas sintéticas no formato do `tcpdump -nn -X`: pacotes IPv4+TCP
+# bem-formados (cabeçalhos reais), para exercitar a remoção de cabeçalhos e os
+# offsets ISO 8583 do parser de ponta a ponta.
+# ---------------------------------------------------------------------------
+
+TCP_SYN, TCP_SYN_ACK, TCP_PSH_ACK, TCP_RST_ACK = 0x02, 0x12, 0x18, 0x14
+
+
+def _build_ipv4_tcp_packet(src_ip, dst_ip, sport, dport, flags, payload=b""):
+    tcp = struct.pack("!HHIIBBHHH", sport, dport, 1000, 2000, 5 << 4, flags, 65535, 0, 0)
+    total_len = 20 + len(tcp) + len(payload)
+    ip = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, total_len, 0, 0x4000, 64, 6, 0,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+    )
+    return ip + tcp + payload
+
+
+def _hexdump_x(packet):
+    lines = []
+    for off in range(0, len(packet), 16):
+        chunk = packet[off:off + 16]
+        groups = [chunk[i:i + 2].hex() for i in range(0, len(chunk), 2)]
+        hex_part = " ".join(groups).ljust(39)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"\t0x{off:04x}:  {hex_part}  {ascii_part}")
+    return "\n".join(lines)
+
+
+def _entry(time, src, sport, dst, dport, flag_txt, flags, payload=b""):
+    pkt = _build_ipv4_tcp_packet(src, dst, sport, dport, flags, payload)
+    header = (
+        f"{time} IP {src}.{sport} > {dst}.{dport}: "
+        f"Flags [{flag_txt}], seq 1000, win 502, length {len(payload)}"
+    )
+    return header + "\n" + _hexdump_x(pkt) + "\n"
+
+
+def _iso_payload(mti, bit70, bit11="000123"):
+    """Mensagem ISO 8583 sintética: 7 bytes de prefixo (tamanho + header) -> MTI
+    (4 ASCII) -> bitmap (32 chars ASCII-hex) -> campos de tamanho fixo. Total 94
+    bytes = 188 chars hex, batendo com os offsets do parser (MTI em 14, bit7 em 86...)."""
+    prefix = b"\x00\x5a" + b"ISO01"
+    bitmap = b"8220000000000000" + b"0400000000000000"
+    fields = (
+        b"0920140102"          # bit 7
+        + bit11.encode()       # bit 11 (STAN)
+        + b"123456"            # bit 32
+        + b"000000000123"      # bit 37 (RRN/NSU)
+        + bit70.encode()       # bit 70 (NMIC)
+        + b"12345"             # bit 100
+        + b"123456789"         # bit 127
+    )
+    return prefix + mti.encode() + bitmap + fields
+
+
+SAMPLE_TCPDUMP = (
+    _entry("14:01:02.100000", "10.1.1.5", 51000, "10.1.1.10", 443, "S", TCP_SYN)
+    + _entry("14:01:02.100500", "10.1.1.10", 443, "10.1.1.5", 51000, "S.", TCP_SYN_ACK)
+    + _entry("14:01:02.101000", "10.1.1.5", 51000, "10.1.1.10", 443, "P.", TCP_PSH_ACK,
+             _iso_payload("0800", "301"))
+    + _entry("14:01:02.150000", "10.1.1.10", 443, "10.1.1.5", 51000, "P.", TCP_PSH_ACK,
+             _iso_payload("0810", "301"))
+    + _entry("14:01:02.170000", "10.1.1.5", 51000, "10.1.1.10", 443, "P.", TCP_PSH_ACK,
+             _iso_payload("0800", "001", bit11="000124"))
+    + _entry("14:01:02.200000", "10.1.1.10", 443, "10.1.1.5", 51000, "R.", TCP_RST_ACK)
+)
+
+# Payload TCP que NÃO é ISO 8583 (banner SSH) — não pode gerar MTI/bits/marcadores.
+SAMPLE_NON_ISO = _entry(
+    "14:02:00.000000", "10.1.1.5", 40000, "10.1.1.10", 22, "P.", TCP_PSH_ACK,
+    b"SSH-2.0-OpenSSH_7.4\r\n",
+)
+
+# Payload curto demais para ter MTI estruturado, mas com o token "0800" — cai na
+# heurística legada (marcador request_0800), só olhando o payload TCP.
+SAMPLE_LEGACY = _entry(
+    "14:03:00.000000", "10.1.1.5", 40001, "10.1.1.10", 9000, "P.", TCP_PSH_ACK,
+    b"xx0800yy",
+)
 
 SAMPLE_LIST_VS = """\
 ltm virtual vs_web_443 {
@@ -52,17 +124,53 @@ Status
 
 
 def run():
-    print("== tcpdump parser ==")
+    print("== tcpdump parser (flags + ISO 8583) ==")
     packets = tcpdump_parser.parse_tcpdump_output(SAMPLE_TCPDUMP)
-    assert len(packets) == 5, f"esperado 5 pacotes, veio {len(packets)}"
+    assert len(packets) == 6, f"esperado 6 pacotes, veio {len(packets)}"
     labels = [p["flags_label"] for p in packets]
-    assert labels == ["SYN", "SYN-ACK", "PSH-ACK", "PSH-ACK", "RST-ACK"], labels
-    assert any("request_0800" in m for m in packets[2]["markers_found"]), packets[2]
-    assert any("response_0810" in m for m in packets[3]["markers_found"]), packets[3]
+    assert labels == ["SYN", "SYN-ACK", "PSH-ACK", "PSH-ACK", "PSH-ACK", "RST-ACK"], labels
+
+    # pacotes sem payload não têm MTI
+    assert packets[0]["mti"] is None and packets[5]["mti"] is None
+
+    echo_req, echo_resp, signon = packets[2], packets[3], packets[4]
+    assert echo_req["mti"] == "0800" and echo_resp["mti"] == "0810", (echo_req, echo_resp)
+    assert echo_req["bit7"] == "0920140102", echo_req
+    assert echo_req["bit11"] == "000123", echo_req
+    assert echo_req["bit32"] == "123456", echo_req
+    assert echo_req["bit37"] == "000000000123", echo_req
+    assert echo_req["bit70"] == "301" and echo_req["bit70_desc"] == "Echo Test", echo_req
+    assert echo_req["bit100"] == "12345" and echo_req["bit127"] == "123456789", echo_req
+    assert echo_req["is_echo_test"] and not echo_req["is_signon"], echo_req
+    assert "MTI:0800" in echo_req["markers_found"], echo_req["markers_found"]
+    assert "NMIC:301" in echo_req["markers_found"], echo_req["markers_found"]
+    assert echo_resp["is_echo_test"], echo_resp
+    assert signon["bit70"] == "001" and signon["is_signon"], signon
+    assert signon["bit70_desc"] == "Sign-On" and signon["bit11"] == "000124", signon
+
     summary = tcpdump_parser.summarize(packets)
     assert summary["syn"] == 1 and summary["syn_ack"] == 1 and summary["rst_ack"] == 1
-    assert summary["request_0800_count"] == 1 and summary["response_0810_count"] == 1
+    assert summary["psh_ack"] == 3, summary
+    assert summary["mti_counts"] == {"0800": 2, "0810": 1}, summary
+    assert summary["network_codes"] == {"301": 2, "001": 1}, summary
+    assert summary["echo_tests"] == 2 and summary["signon"] == 1 and summary["signoff"] == 0
+    assert summary["request_0800_count"] == 2 and summary["response_0810_count"] == 1
     print("OK:", summary)
+
+    print("== tcpdump parser (payload nao-ISO nao gera falso positivo) ==")
+    non_iso = tcpdump_parser.parse_tcpdump_output(SAMPLE_NON_ISO)
+    assert len(non_iso) == 1, non_iso
+    assert non_iso[0]["mti"] is None and non_iso[0]["bit70"] is None, non_iso[0]
+    assert non_iso[0]["markers_found"] == [], non_iso[0]
+    print("OK: banner SSH sem MTI/bits/marcadores")
+
+    print("== tcpdump parser (fallback legado 0800 no payload) ==")
+    legacy = tcpdump_parser.parse_tcpdump_output(SAMPLE_LEGACY)
+    assert len(legacy) == 1 and legacy[0]["mti"] is None, legacy
+    assert any("request_0800" in m for m in legacy[0]["markers_found"]), legacy[0]
+    legacy_summary = tcpdump_parser.summarize(legacy)
+    assert legacy_summary["request_0800_count"] == 1, legacy_summary
+    print("OK:", legacy[0]["markers_found"])
 
     print("== tmsh parser (virtual servers) ==")
     vs_list = tmsh_parser.parse_virtual_servers(SAMPLE_LIST_VS)
@@ -103,6 +211,72 @@ def run():
 
     assert safety.assert_safe_tmsh_command("tmsh show ltm virtual vs_web_443").startswith("tmsh show")
     print("OK: comando read-only permitido")
+
+    print("== safety: porta TCP 1222 (captura RISe) proibida no tcpdump ==")
+    base = "tcpdump -nn -X -i any -c 10"
+    blocked_cases = {
+        "porta 1222 explicita": f"{base} port 1222",
+        "1222 dentro de OR": f"{base} (port 15000 or port 1222)",
+        "src/dst port 1222": f"{base} dst port 1222",
+        "portrange que inclui 1222": f"{base} portrange 1000-2000",
+        "1222 com zeros a esquerda": f"{base} port 01222",
+        "1222 junto de host": f"{base} port 1222 and host 10.100.2.1",
+    }
+    for label, cmd in blocked_cases.items():
+        try:
+            safety.assert_safe_tcpdump_command(cmd)
+            raise AssertionError(f"deveria ter bloqueado: {label}: {cmd}")
+        except safety.BlockedPortError as exc:
+            assert "1222" in str(exc) and "RISe" in str(exc), (label, str(exc))
+            assert "desabilitadas para esta ferramenta" in str(exc), (label, str(exc))
+    print(f"OK: {len(blocked_cases)} variações bloqueadas com mensagem RISe")
+
+    ok_cmd = f"{base} port 15000 and host 10.100.2.1"
+    assert safety.assert_safe_tcpdump_command(ok_cmd) == ok_cmd
+    assert safety.assert_safe_tcpdump_command(base) == base  # sem filtro: não é alterado
+    assert safety.require_capturable_port(15000, "node_port") == 15000
+    for bad in (1222, "1222", " 1222 ", 1222.0):  # qualquer forma de entrada da porta
+        try:
+            safety.require_capturable_port(bad, "node_port")
+            raise AssertionError(f"deveria ter bloqueado porta {bad!r}")
+        except safety.BlockedPortError as exc:
+            assert str(exc) == (
+                "Capturas na porta TCP 1222 (porta de conexão com a captura RISe) estão "
+                "desabilitadas para esta ferramenta."
+            ), str(exc)
+    print("OK: porta comum passa; 1222 bloqueada em qualquer forma; mensagem exata ao usuário")
+
+    print("== f5_client: tcpdump_capture respeita a proibição (sem rede) ==")
+    device = Device(
+        name="f5-selftest", host="192.0.2.1", port=22, partition="Common", tags=[],
+        credentials=DeviceCredentials(user="u", password="p", key_path=None),
+    )
+    client = F5Client(device=device, connect_timeout_sec=1, command_timeout_sec=1)
+    ssh_calls = []
+
+    def fake_run(cmd):
+        ssh_calls.append(cmd)
+        return CommandResult(command=cmd, stdout="", stderr="", exit_status=0)
+
+    client._run = fake_run
+    client.count_running_tcpdump = lambda: 0
+    capture_kwargs = dict(interface="any", count=5, max_count=500, timeout_sec=5, max_timeout_sec=60)
+
+    for kwargs in ({"server_port": 1222, "node_port": None}, {"server_port": None, "node_port": 1222}):
+        try:
+            client.tcpdump_capture(**capture_kwargs, **kwargs)
+            raise AssertionError(f"deveria ter bloqueado {kwargs}")
+        except safety.BlockedPortError:
+            pass
+    assert ssh_calls == [], "porta proibida não pode gerar NENHUM comando no F5"
+
+    client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=15000, host="10.100.2.1")
+    assert ssh_calls[-1].endswith("port 15000 and host 10.100.2.1"), ssh_calls[-1]
+    assert "1222" not in ssh_calls[-1], "o filtro BPF não deve ser alterado pela proibição"
+
+    client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=None)  # sem filtro nenhum
+    assert ssh_calls[-1].endswith("-c 5"), ssh_calls[-1]
+    print("OK: 1222 recusada na validação, sem tocar no F5; filtro normal intacto:", ssh_calls[-2])
 
     print("\nTODOS OS AUTO-TESTES PASSARAM")
 

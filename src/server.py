@@ -22,7 +22,7 @@ from .f5_client import (
     describe_tcpdump_warnings,
 )
 from .inventory import Inventory, InventoryError
-from .safety import UnsafeInputError
+from .safety import BlockedPortError, UnsafeInputError
 
 mcp = FastMCP(
     "f5-bigip-monitor",
@@ -226,6 +226,11 @@ def tcpdump_validate_traffic(
     instâncias tmm excedido) que apareça no stderr — cobre o caso raro de outra
     captura começar bem entre o check e o início desta.
 
+    Portas proibidas: capturas na porta TCP 1222 (porta de conexão com a captura
+    RISe) estão desabilitadas para esta ferramenta — um pedido envolvendo essa porta
+    é recusado na validação dos parâmetros e retorna status 'blocked', sem sequer
+    conectar no F5.
+
     Requer que a conta SSH tenha 'Advanced shell (bash)' habilitado no BIG-IP (tcpdump
     não roda dentro do prompt tmsh)."""
     inv = _get_inventory()
@@ -241,6 +246,13 @@ def tcpdump_validate_traffic(
             timeout_sec=timeout_sec,
             max_timeout_sec=inv.limits.tcpdump_max_duration_sec,
         )
+    except BlockedPortError as exc:
+        # Porta proibida para esta ferramenta (ex: 1222, conexão com a captura RISe).
+        # Retorno estruturado — não é erro de uso, é política: não adianta retentar.
+        return {
+            "status": "blocked",
+            "message": str(exc),
+        }
     except TcpdumpBusyError as exc:
         return {
             "status": "busy",
