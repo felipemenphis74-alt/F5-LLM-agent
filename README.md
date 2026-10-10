@@ -42,6 +42,7 @@ f5-mcp-agent/
 ├── .env.example                 # copie para .env e edite
 ├── data/                        # coloque aqui os .xlsx de baseline dos clientes
 ├── onbox/                       # script + extensão iControl LX instalados no BIG-IP (captura)
+├── reference/ssh_capture/       # só referência: o antigo cenário de captura por SSH (não usado)
 └── src/
     ├── server.py                # servidor MCP (FastMCP) — ferramentas expostas
     ├── safety.py                # allowlist/validação — camada de segurança
