@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover - so em ambientes sem syslog
 TCPDUMP_CANDIDATES = ("/usr/sbin/tcpdump", "/sbin/tcpdump", "/usr/bin/tcpdump")
 
 MAX_COUNT = 500
-MAX_TIMEOUT_SEC = 60
+MAX_TIMEOUT_SEC = 180
 DEFAULT_COUNT = 100
 DEFAULT_TIMEOUT_SEC = 20
 SNAPLEN = 512                    # cobre cabecalhos + os 94 bytes de ISO 8583

@@ -27,7 +27,7 @@ var CONFIG = {
     maxStderrBytes: 4096,
     maxInFlight: 4,            // processos simultaneos deste worker
     defaultTimeoutSec: 20,     // espelha o f5_tcpdump.py
-    maxTimeoutSec: 60,
+    maxTimeoutSec: 180,        // espelha MAX_TIMEOUT_SEC do f5_tcpdump.py
     deadlineMarginSec: 15,     // folga alem do timeout_sec do pedido
     killGraceMs: 3000
 };
