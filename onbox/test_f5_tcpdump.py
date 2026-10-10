@@ -109,7 +109,8 @@ def test_validation():
                               "host": "10.100.2.1", "count": 50, "timeout_sec": 10})
     assert ok == {"interface": "any", "server_port": 443, "node_port": 15000,
                   "host": "10.100.2.1", "count": 50, "timeout_sec": 10,
-                  "vs_addr": None, "verbose": False, "detalhes": False, "stan": None}, ok
+                  "vs_addr": None, "client_addr": None, "node_addr": None,
+                  "verbose": False, "detalhes": False, "stan": None}, ok
     assert ft.validate_request({"vs_addr": "10.100.1.10", "verbose": True})["vs_addr"] == \
         "10.100.1.10"
     assert ft.validate_request({"host": "2001:db8::1"})["host"] == "2001:db8::1"
@@ -141,6 +142,10 @@ def test_validation():
         "verbose numero": {"verbose": 1},
         "vs_addr DNS": {"vs_addr": "vs.example.com"},
         "vs_addr com filtro": {"vs_addr": "10.1.1.1 or port 1222"},
+        "node_addr DNS": {"node_port": 15000, "node_addr": "node.example.com"},
+        "client_addr com filtro": {"server_port": 17000, "client_addr": "1.1.1.1 or port 22"},
+        "client_addr sem server_port": {"client_addr": "192.168.0.9"},
+        "node_addr sem node_port": {"node_addr": "192.168.0.9"},
         "detalhes texto": {"detalhes": "sim"},
         "stan letras": {"stan": "12a"},
         "stan vazio": {"stan": ""},
@@ -176,6 +181,21 @@ def test_build_argv():
                     "-w", "-", "--", "port", "15000", "and", "host", "10.100.2.1"], argv
     both = ft.validate_request({"server_port": 443, "node_port": 15000})
     assert ft.build_argv(both, "t")[-7:] == ["(", "port", "443", "or", "port", "15000", ")"]
+    # IP E porta por perna: duas VS no mesmo IP (:17000 e :15000) nao se misturam
+    legs = ft.validate_request({"server_port": 17000, "vs_addr": "10.100.1.10",
+                                "client_addr": "192.168.0.50", "node_port": 15000,
+                                "node_addr": "192.168.0.9"})
+    tail = ft.build_argv(legs, "t")
+    assert tail[tail.index("--") + 1:] == [
+        "(", "(", "port", "17000", "and", "host", "10.100.1.10", "and", "host",
+        "192.168.0.50", ")", "or", "(", "port", "15000", "and", "host", "192.168.0.9", ")",
+        ")"], tail
+    vs_only = ft.build_argv(ft.validate_request({"server_port": 17000,
+                                                 "vs_addr": "10.100.1.10"}), "t")
+    assert vs_only[vs_only.index("--") + 1:] == ["port", "17000", "and", "host",
+                                                 "10.100.1.10"], vs_only
+    same = ft.build_argv(ft.validate_request({"server_port": 15000, "node_port": 15000}), "t")
+    assert same[same.index("--") + 1:] == ["port", "15000"], same
     bare = ft.build_argv(ft.validate_request({}), "t")
     assert "--" not in bare and bare[-2:] == ["-w", "-"], bare
     assert all(isinstance(token, str) for token in argv)
@@ -492,6 +512,22 @@ def _vs_scenario_frames():
     return frames
 
 
+def _shared_vs_frames():
+    """Cenario da captura real: OUTRA VS no MESMO IP (10.100.1.10:15000) e com o MESMO
+    member (192.168.0.9:15000), com 1 transacao 0100 (STAN 333333)."""
+    client, vs, snat, node = "192.168.0.9", "10.100.1.10", "10.100.1.20", "192.168.0.9"
+    frames = []
+
+    def add(src, dst, sport, dport, flags, payload=b""):
+        frames.append(eth(ipv4_packet(src, dst, tcp_segment(sport, dport, flags, payload))))
+
+    add(client, vs, 50100, 15000, TCP_PSH_ACK, iso_payload("0100", "000", bit11="333333"))
+    add(snat, node, 50100, 15000, TCP_PSH_ACK, iso_payload("0100", "000", bit11="333333"))
+    add(node, snat, 15000, 50100, TCP_PSH_ACK, iso_payload("0110", "000", bit11="333333"))
+    add(vs, client, 15000, 50100, TCP_PSH_ACK, iso_payload("0110", "000", bit11="333333"))
+    return frames
+
+
 def test_simplified_output():
     print("== resposta simples: so o trafego da VS, sem sondas do monitor ==")
     work = fresh_dir()
@@ -586,6 +622,18 @@ def test_simplified_output():
     assert none_tx["transacoes"] == [] and "tabela_markdown" not in none_tx, none_tx
     assert none_tx["resultado"] == "Nenhuma transação com STAN 999999 na janela capturada."
 
+    # outra VS no mesmo IP e com o mesmo member: suas 2 pernas ficam de fora (com aviso)
+    mixed = ft.parse_pcap(pcap(_vs_scenario_frames() + _shared_vs_frames()))
+    for args in ((17000, 15000, "10.100.1.10"), (17000, 15000, None)):
+        view, notes = ft.simplified_view(mixed, *args)
+        assert [t["stan"] for t in view["transacoes"]] == ["111111", "222222"], (args, view)
+        assert view["trafego"]["pacotes"] == 14 and view["trafego"]["conexoes"] == 2, view
+        assert any("2 conexão(ões) de outra(s) VS" in n and "(4 pacotes)" in n
+                   for n in notes), notes
+    # a outra VS, pedida pelo seu proprio IP:porta, sai sozinha
+    other = ft.simplified_view(mixed, 15000, 15000, "10.100.1.10")[0]
+    assert [t["stan"] for t in other["transacoes"]] == ["333333"], other
+
     # nada da VS na janela
     probes_only = [f for f in _vs_scenario_frames()[-9:]]
     empty = ft.simplified_view(ft.parse_pcap(pcap(probes_only)), 17000, 15000, "10.100.1.10")
@@ -601,7 +649,7 @@ def test_simplified_parity_with_agent():
     except ImportError as exc:
         print("PULADO (rode a partir da raiz do repo com PYTHONPATH=.): %s" % exc)
         return
-    packets = ft.parse_pcap(pcap(_vs_scenario_frames()))
+    packets = ft.parse_pcap(pcap(_vs_scenario_frames() + _shared_vs_frames()))
     for args in ((17000, 15000, "10.100.1.10"), (17000, 15000, None), (None, 15000, None),
                  (17000, 17000, None), (17000, None, "10.100.1.10")):
         mine = ft.simplified_view(packets, *args)

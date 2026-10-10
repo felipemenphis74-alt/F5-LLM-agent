@@ -21,7 +21,8 @@ Uso:
         | python f5_tcpdump.py
     python f5_tcpdump.py --request '{"node_port": 15000}'
 
-Entrada (JSON): interface, server_port, node_port, host, count, timeout_sec.
+Entrada (JSON): interface, server_port, node_port, host, vs_addr, client_addr, node_addr,
+count, timeout_sec (e verbose, detalhes, stan).
 Saida (JSON): status = ok | busy | blocked | invalid | error, mais os campos abaixo.
 Precisa rodar como root (tcpdump).
 """
@@ -70,7 +71,7 @@ BLOCKED_PORTS = {
 }
 
 ALLOWED_KEYS = ("interface", "server_port", "node_port", "host", "count", "timeout_sec",
-                "vs_addr", "verbose", "detalhes", "stan")
+                "vs_addr", "client_addr", "node_addr", "verbose", "detalhes", "stan")
 MAX_TRANSACTIONS = 50
 ISO_BIT_FIELDS = ("bit7", "bit11", "bit32", "bit37", "bit70", "bit100", "bit127")
 EXPECTED_HOPS = 4        # cliente->VS, F5->node, node->F5, VS->cliente
@@ -215,10 +216,19 @@ def validate_request(request):
     host = request.get("host")
     host = None if host is None else _to_ip(host, "host")
 
-    # vs_addr NAO entra no filtro do tcpdump: so permite separar, na resposta, o
-    # trafego da VS das sondas do monitor do pool (junto de server_port).
+    # IP por perna: com server_port, vs_addr (e client_addr) restringem o lado cliente
+    # a "port VS and host VS"; com node_port, node_addr restringe o lado servidor. Sem
+    # isso, duas VS no mesmo IP ou o mesmo node em varios pools entram na captura.
     vs_addr = request.get("vs_addr")
     vs_addr = None if vs_addr is None else _to_ip(vs_addr, "vs_addr")
+    client_addr = request.get("client_addr")
+    client_addr = None if client_addr is None else _to_ip(client_addr, "client_addr")
+    node_addr = request.get("node_addr")
+    node_addr = None if node_addr is None else _to_ip(node_addr, "node_addr")
+    if client_addr is not None and server_port is None:
+        raise RequestError("invalid", "'client_addr' exige 'server_port' (porta da VS).")
+    if node_addr is not None and node_port is None:
+        raise RequestError("invalid", "'node_addr' exige 'node_port' (porta do node).")
 
     verbose = request.get("verbose", False)
     if not isinstance(verbose, bool):
@@ -241,23 +251,41 @@ def validate_request(request):
     return {
         "interface": str(interface), "server_port": server_port, "node_port": node_port,
         "host": host, "count": count, "timeout_sec": timeout_sec,
-        "vs_addr": vs_addr, "verbose": verbose, "detalhes": detalhes, "stan": stan,
+        "vs_addr": vs_addr, "client_addr": client_addr, "node_addr": node_addr,
+        "verbose": verbose, "detalhes": detalhes, "stan": stan,
     }
+
+
+def _leg(port, *addrs):
+    tokens = ["port", str(port)]
+    for addr in addrs:
+        if addr is not None:
+            tokens.extend(["and", "host", addr])
+    return tokens
 
 
 def build_argv(params, tcpdump_bin):
     """Lista de argumentos do tcpdump - sem shell. Os termos do filtro sao tokens
-    separados e vem so de valores ja validados."""
-    ports = []
-    for port in (params["server_port"], params["node_port"]):
-        if port is not None and port not in ports:
-            ports.append(port)
+    separados e vem so de valores ja validados. Cada perna e "porta E IP(s)":
+    (port VS and host VS [and host cliente]) or (port node [and host node])."""
+    legs = []
+    if params["server_port"] is not None:
+        legs.append(_leg(params["server_port"], params["vs_addr"], params["client_addr"]))
+    if params["node_port"] is not None:
+        node_leg = _leg(params["node_port"], params["node_addr"])
+        if node_leg not in legs:
+            legs.append(node_leg)
 
     terms = []
-    if len(ports) == 1:
-        terms.append(["port", str(ports[0])])
-    elif len(ports) == 2:
-        terms.append(["(", "port", str(ports[0]), "or", "port", str(ports[1]), ")"])
+    if len(legs) == 1:
+        terms.append(legs[0])
+    elif len(legs) == 2:
+        joined = ["("]
+        for index, leg in enumerate(legs):
+            if index:
+                joined.append("or")
+            joined.extend(["("] + leg + [")"] if len(leg) > 2 else leg)
+        terms.append(joined + [")"])
     if params["host"] is not None:
         terms.append(["host", params["host"]])
 
@@ -283,8 +311,9 @@ def _assert_argv_safe(argv, params):
         return
     keywords = ("(", ")", "port", "or", "and", "host")
     allowed_values = set(str(p) for p in (params["server_port"], params["node_port"]) if p)
-    if params["host"]:
-        allowed_values.add(params["host"])
+    for key in ("host", "vs_addr", "client_addr", "node_addr"):
+        if params[key]:
+            allowed_values.add(params[key])
     tail = argv[argv.index("--") + 1:]
     for position, token in enumerate(tail):
         if token not in keywords and token not in allowed_values:
@@ -675,17 +704,20 @@ def focus_vs_traffic(packets, server_port=None, node_port=None, vs_addr=None):
     """Mantem so o trafego da VS pedida e descarta os fluxos do monitor do pool
     (SYN/SYN-ACK/RST sem dados e sem handshake completo no lado do node). So descarta
     quando o lado da VS e identificavel: vs_addr + server_port, ou server_port diferente
-    de node_port. Devolve (pacotes mantidos, info)."""
-    info = {"separated": False, "probe_flows": 0, "probe_packets": 0}
+    de node_port. Uma perna do node so fica se for de uma conexao da VS (mesmo STAN ou
+    mesma porta efemera do cliente, que o F5 preserva no SNAT); o resto e de outra VS
+    que divide o IP da VS ou o node (ex: VS :15000 no mesmo IP, pool com o mesmo
+    member) e e descartado. Devolve (pacotes mantidos, info)."""
+    info = {"separated": False, "probe_flows": 0, "probe_packets": 0,
+            "other_flows": 0, "other_packets": 0}
     if server_port is not None and vs_addr is not None:
         vs_endpoint = "%s.%d" % (vs_addr, server_port)
 
-        def is_vs_side(pkt):
-            return vs_endpoint in (pkt["src"], pkt["dst"])
+        def is_vs_endpoint(endpoint):
+            return endpoint == vs_endpoint
     elif server_port is not None and node_port is not None and server_port != node_port:
-        def is_vs_side(pkt):
-            return server_port in (_endpoint_parts(pkt["src"])[1],
-                                   _endpoint_parts(pkt["dst"])[1])
+        def is_vs_endpoint(endpoint):
+            return _endpoint_parts(endpoint)[1] == server_port
     else:
         return list(packets), info
 
@@ -694,18 +726,30 @@ def focus_vs_traffic(packets, server_port=None, node_port=None, vs_addr=None):
     for pkt in packets:
         flows.setdefault(_flow_key(pkt), []).append(pkt)
 
-    keep = set()
+    vs_flows = set()
+    vs_stans = set()
+    client_ports = set()
     for key, pkts in flows.items():
-        probe = (
-            not any(is_vs_side(p) for p in pkts)
-            and all(p.get("payload_len", 0) == 0 and not p.get("mti")
+        if any(is_vs_endpoint(e) for e in key):
+            vs_flows.add(key)
+            vs_stans.update(p["bit11"] for p in pkts if p.get("mti") and p.get("bit11"))
+            client_ports.update(_endpoint_parts(e)[1] for e in key if not is_vs_endpoint(e))
+
+    keep = set(vs_flows)
+    for key, pkts in flows.items():
+        if key in vs_flows:
+            continue
+        probe = all(p.get("payload_len", 0) == 0 and not p.get("mti")
                     and p["flags_label"] in PROBE_LABELS for p in pkts)
-        )
         if probe:
             info["probe_flows"] += 1
             info["probe_packets"] += len(pkts)
-        else:
+        elif (any(p.get("bit11") in vs_stans for p in pkts if p.get("mti") and p.get("bit11"))
+              or any(_endpoint_parts(e)[1] in client_ports for e in key)):
             keep.add(key)
+        else:
+            info["other_flows"] += 1
+            info["other_packets"] += len(pkts)
     return [p for p in packets if _flow_key(p) in keep], info
 
 
@@ -884,6 +928,10 @@ def simplified_view(packets, server_port=None, node_port=None, vs_addr=None,
     if info["probe_flows"]:
         notes.append("%d sonda(s) do monitor do pool (%d pacotes) foram ignoradas: não são "
                      "tráfego da VS." % (info["probe_flows"], info["probe_packets"]))
+    if info["other_flows"]:
+        notes.append("%d conexão(ões) de outra(s) VS que dividem o IP da VS ou o node (%d "
+                     "pacotes) foram ignoradas: não são da VS pedida." % (
+                         info["other_flows"], info["other_packets"]))
     if not info["separated"] and kept:
         notes.append("Não foi possível separar o tráfego da VS do restante (informe vs_addr "
                      "junto de server_port, ou use portas de VS e de node diferentes): nada "
