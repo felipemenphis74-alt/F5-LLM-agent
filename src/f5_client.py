@@ -275,7 +275,9 @@ class F5Client:
         # remoto garantem que a captura não fica presa mesmo sem atingir -c.
         cmd_parts = ["tcpdump", "-nn", "-X", "-i", shlex.quote(interface), "-c", str(int(count))]
         if filter_expr:
-            cmd_parts.append(filter_expr)
+            # O filtro BPF vai como UM argumento, entre aspas: sem isso o shell remoto
+            # recusa os parenteses de "(port A or port B)" (erro de sintaxe, exit 1).
+            cmd_parts.append(shlex.quote(filter_expr))
         tcpdump_cmd = " ".join(cmd_parts)
         assert_safe_tcpdump_command(tcpdump_cmd)
 

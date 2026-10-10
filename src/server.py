@@ -226,6 +226,9 @@ def tcpdump_validate_traffic(
     instâncias tmm excedido) que apareça no stderr — cobre o caso raro de outra
     captura começar bem entre o check e o início desta.
 
+    Se o próprio tcpdump falhar (exit_status diferente de 0 e 124), o retorno é
+    status 'error' com o stderr — nunca 'ok' com zero pacotes.
+
     Portas proibidas: capturas na porta TCP 1222 (porta de conexão com a captura
     RISe) estão desabilitadas para esta ferramenta — um pedido envolvendo essa porta
     é recusado na validação dos parâmetros e retorna status 'blocked', sem sequer
@@ -258,6 +261,17 @@ def tcpdump_validate_traffic(
             "status": "busy",
             "message": str(exc),
             "retry_after_minutes": TCPDUMP_BUSY_RETRY_MINUTES,
+        }
+
+    # 0 = terminou por -c; 124 = prazo duro do `timeout` (esperado com pouco tráfego).
+    # Qualquer outro código é falha do próprio tcpdump/shell — não pode virar "ok".
+    if result.exit_status not in (0, 124):
+        return {
+            "status": "error",
+            "message": "O tcpdump falhou (exit_status=%s): %s" % (
+                result.exit_status, (result.stderr or "sem stderr").strip()[-500:]),
+            "command": result.command,
+            "exit_status": result.exit_status,
         }
 
     packets = tcpdump_parser.parse_tcpdump_output(result.stdout)

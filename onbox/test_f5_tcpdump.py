@@ -398,6 +398,12 @@ def test_run_end_to_end():
     assert warned["status"] == "ok" and len(warned["warnings"]) == 1, warned
     assert "tmm tcpdump instances" in warned["warnings"][0]
 
+    # 4b) falha do proprio tcpdump (interface inexistente, filtro...) -> error, nunca "ok"
+    set_scenario(work, stderr="tcpdump: bogus0: No such device exists\n", exit=1)
+    broken = ft.run({"node_port": 15000}, **common)
+    assert broken["status"] == "error" and broken["exit_status"] == 1, broken
+    assert "No such device" in broken["message"], broken
+
     # 5) concorrencia: 1 rodando -> ok; 2 rodando -> busy, sem executar
     set_scenario(work, pcap=pcap_path, record=record)
     if os.path.exists(record):

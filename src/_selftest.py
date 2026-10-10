@@ -1,8 +1,12 @@
 """Auto-teste rápido (sem F5 real) dos parsers e das camadas de segurança.
 Roda dentro do container: docker run --rm --entrypoint python f5-mcp-agent:test -m src._selftest
 """
+import shlex
+import shutil
 import socket
 import struct
+import subprocess
+from types import SimpleNamespace
 
 from . import tcpdump_parser, tmsh_parser, safety, comparator
 from .f5_client import CommandResult, F5Client
@@ -271,12 +275,52 @@ def run():
     assert ssh_calls == [], "porta proibida não pode gerar NENHUM comando no F5"
 
     client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=15000, host="10.100.2.1")
-    assert ssh_calls[-1].endswith("port 15000 and host 10.100.2.1"), ssh_calls[-1]
+    assert ssh_calls[-1].endswith("'port 15000 and host 10.100.2.1'"), ssh_calls[-1]
     assert "1222" not in ssh_calls[-1], "o filtro BPF não deve ser alterado pela proibição"
 
     client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=None)  # sem filtro nenhum
     assert ssh_calls[-1].endswith("-c 5"), ssh_calls[-1]
     print("OK: 1222 recusada na validação, sem tocar no F5; filtro normal intacto:", ssh_calls[-2])
+
+    print("== f5_client: filtro com DUAS portas chega ao shell remoto entre aspas ==")
+    # Regressão de um bug real (visto no F5): sem aspas, "(port A or port B)" é erro de
+    # sintaxe do shell -> tcpdump nem roda (exit 1, 0 pacotes).
+    client.tcpdump_capture(**capture_kwargs, server_port=15000, node_port=16000)
+    two_ports = ssh_calls[-1]
+    assert two_ports.endswith("'(port 15000 or port 16000)'"), two_ports
+    assert shlex.split(two_ports)[-1] == "(port 15000 or port 16000)", shlex.split(two_ports)
+    shell = shutil.which("sh")
+    if shell:
+        buggy = "timeout 5 tcpdump -nn -c 5 (port 15000 or port 16000)"
+        assert subprocess.run([shell, "-n", "-c", buggy], capture_output=True).returncode != 0, \
+            "o comando sem aspas deveria ser erro de sintaxe do shell"
+        fixed = subprocess.run([shell, "-n", "-c", two_ports], capture_output=True)
+        assert fixed.returncode == 0, fixed.stderr
+        print("OK: sh -n aceita o comando entre aspas; recusa a forma antiga")
+    else:
+        print("OK (sh indisponível: só a forma do argumento foi conferida)")
+
+    print("== server: falha do próprio tcpdump nunca vira status ok ==")
+    from . import server
+
+    class FakeClient:
+        def __init__(self, exit_status, stderr=""):
+            self.exit_status, self.stderr = exit_status, stderr
+
+        def tcpdump_capture(self, **kwargs):
+            return CommandResult(command="tcpdump ...", stdout="", stderr=self.stderr,
+                                 exit_status=self.exit_status)
+
+    server._get_inventory = lambda: SimpleNamespace(
+        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=60))
+    server._client_for = lambda device: FakeClient(1, "bash: syntax error near unexpected token `('")
+    failed = server.tcpdump_validate_traffic("f5-selftest", node_port=15000)
+    assert failed["status"] == "error" and failed["exit_status"] == 1, failed
+    assert "syntax error" in failed["message"], failed
+    for good in (0, 124):  # 124 = prazo duro, esperado com pouco tráfego
+        server._client_for = lambda device, code=good: FakeClient(code)
+        assert server.tcpdump_validate_traffic("f5-selftest", node_port=15000)["status"] == "ok"
+    print("OK: exit 1 -> status error com stderr; 0 e 124 -> ok")
 
     print("\nTODOS OS AUTO-TESTES PASSARAM")
 
