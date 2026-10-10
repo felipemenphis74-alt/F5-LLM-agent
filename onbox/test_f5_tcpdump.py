@@ -1,0 +1,507 @@
+# -*- coding: utf-8 -*-
+"""Testes do f5_tcpdump.py SEM depender do F5 (nem de tcpdump real).
+
+Rodar (Python 3, a partir da raiz do repo):
+    PYTHONPATH=. python onbox/test_f5_tcpdump.py
+
+Cobre: validacao/safety, parsing de pcap (Ethernet/SLL/SLL2/VLAN/IPv6/opcoes TCP/
+truncado), paridade com o parser de texto do agente (src/tcpdump_parser.py),
+caminho completo run() com um `tcpdump` falso, concorrencia, CLI e um lint de
+compatibilidade com Python 2.7.
+"""
+import ast
+import json
+import os
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import f5_tcpdump as ft  # noqa: E402
+
+SCRIPT = os.path.join(HERE, "f5_tcpdump.py")
+BLOCKED_MESSAGE = ("Capturas na porta TCP 1222 (porta de conexão com a captura RISe) "
+                   "estão desabilitadas para esta ferramenta.")
+
+TCP_SYN, TCP_SYN_ACK, TCP_PSH_ACK, TCP_RST_ACK = 0x02, 0x12, 0x18, 0x14
+
+
+# ---------------------------------------------------------------------------
+# Construtores de pacotes / pcap
+# ---------------------------------------------------------------------------
+
+def iso_payload(mti, bit70, bit11="000123"):
+    """94 bytes: 7 de prefixo + MTI(4) + bitmap(32) + campos (offsets do parser)."""
+    prefix = b"\x00\x5a" + b"ISO01"
+    bitmap = b"8220000000000000" + b"0400000000000000"
+    fields = (b"0920140102" + bit11.encode() + b"123456" + b"000000000123"
+              + bit70.encode() + b"12345" + b"123456789")
+    return prefix + mti.encode() + bitmap + fields
+
+
+def tcp_segment(sport, dport, flags, payload=b"", options=b""):
+    assert len(options) % 4 == 0
+    data_off = (20 + len(options)) // 4
+    return struct.pack("!HHIIBBHHH", sport, dport, 1000, 2000, data_off << 4, flags,
+                       65535, 0, 0) + options + payload
+
+
+def ipv4_packet(src, dst, l4, proto=6, frag=0, ihl_options=b""):
+    ihl = (20 + len(ihl_options)) // 4
+    total = 20 + len(ihl_options) + len(l4)
+    header = struct.pack("!BBHHHBBH4s4s", (4 << 4) | ihl, 0, total, 0, frag, 64, proto, 0,
+                         socket.inet_aton(src), socket.inet_aton(dst))
+    return header + ihl_options + l4
+
+
+def ipv6_packet(src, dst, l4, next_header=6):
+    header = struct.pack("!IHBB16s16s", 6 << 28, len(l4), next_header, 64,
+                         socket.inet_pton(socket.AF_INET6, src),
+                         socket.inet_pton(socket.AF_INET6, dst))
+    return header + l4
+
+
+def eth(ip, ethertype=0x0800, vlan=None):
+    mac = b"\x00\x11\x22\x33\x44\x55" + b"\x66\x77\x88\x99\xaa\xbb"
+    if vlan is not None:
+        return mac + struct.pack("!HHH", 0x8100, vlan, ethertype) + ip
+    return mac + struct.pack("!H", ethertype) + ip
+
+
+def sll(ip, proto=0x0800):
+    return struct.pack("!HHH8sH", 0, 1, 6, b"\x00" * 8, proto) + ip
+
+
+def sll2(ip, proto=0x0800):
+    return struct.pack("!HHIHBB8s", proto, 0, 1, 1, 0, 6, b"\x00" * 8) + ip
+
+
+def pcap(frames, linktype=1, endian="<", magic=0xA1B2C3D4):
+    out = struct.pack(endian + "IHHiIII", magic, 2, 4, 0, 0, 65535, linktype)
+    for index, frame in enumerate(frames):
+        out += struct.pack(endian + "IIII", 1700000000 + index, 123456, len(frame), len(frame))
+        out += frame
+    return out
+
+
+def one(frames, **kwargs):
+    packets = ft.parse_pcap(pcap(frames, **kwargs))
+    assert len(packets) == 1, packets
+    return packets[0]
+
+
+def fresh_dir():
+    return tempfile.mkdtemp(prefix="f5tcpdump_test_")
+
+
+# ---------------------------------------------------------------------------
+# Testes
+# ---------------------------------------------------------------------------
+
+def test_validation():
+    print("== validacao / safety ==")
+    ok = ft.validate_request({"interface": "any", "server_port": 443, "node_port": "15000",
+                              "host": "10.100.2.1", "count": 50, "timeout_sec": 10})
+    assert ok == {"interface": "any", "server_port": 443, "node_port": 15000,
+                  "host": "10.100.2.1", "count": 50, "timeout_sec": 10}, ok
+    assert ft.validate_request({"host": "2001:db8::1"})["host"] == "2001:db8::1"
+    defaults = ft.validate_request({})
+    assert defaults["count"] == ft.DEFAULT_COUNT and defaults["interface"] == "any"
+
+    invalid = {
+        "chave desconhecida": {"nodeport": 1},
+        "interface com opcao": {"interface": "-w"},
+        "interface com ;": {"interface": "any;reboot"},
+        "interface com espaco": {"interface": "a b"},
+        "host nome DNS": {"host": "evil.example.com"},
+        "host opcao": {"host": "-w"},
+        "host IPv4 incompleto": {"host": "10.1.1"},
+        "host com filtro": {"host": "10.1.1.1 or port 1222"},
+        "porta 0": {"node_port": 0},
+        "porta 70000": {"node_port": 70000},
+        "porta texto": {"node_port": "ssh"},
+        "porta bool": {"node_port": True},
+        "porta float": {"node_port": 15000.0},
+        "count 0": {"count": 0},
+        "count acima": {"count": ft.MAX_COUNT + 1},
+        "timeout 0": {"timeout_sec": 0},
+        "timeout acima": {"timeout_sec": ft.MAX_TIMEOUT_SEC + 1},
+    }
+    for label, request in invalid.items():
+        try:
+            ft.validate_request(request)
+            raise AssertionError("deveria recusar: " + label)
+        except ft.RequestError as exc:
+            assert exc.status == "invalid", (label, exc.status)
+
+    for form in (1222, "1222", " 1222 ", "01222"):
+        for key in ("server_port", "node_port"):
+            try:
+                ft.validate_request({key: form})
+                raise AssertionError("deveria bloquear %r em %s" % (form, key))
+            except ft.RequestError as exc:
+                assert exc.status == "blocked" and exc.message == BLOCKED_MESSAGE, exc.message
+    print("OK: %d pedidos invalidos recusados; 1222 bloqueada em 8 formas" % len(invalid))
+
+
+def test_build_argv():
+    print("== argv do tcpdump (sem shell) ==")
+    base = ft.validate_request({"node_port": 15000, "host": "10.100.2.1", "count": 20,
+                                "timeout_sec": 5})
+    argv = ft.build_argv(base, "/usr/sbin/tcpdump")
+    assert argv == ["/usr/sbin/tcpdump", "-nn", "-U", "-s", "512", "-c", "20", "-i", "any",
+                    "-w", "-", "--", "port", "15000", "and", "host", "10.100.2.1"], argv
+    both = ft.validate_request({"server_port": 443, "node_port": 15000})
+    assert ft.build_argv(both, "t")[-7:] == ["(", "port", "443", "or", "port", "15000", ")"]
+    bare = ft.build_argv(ft.validate_request({}), "t")
+    assert "--" not in bare and bare[-2:] == ["-w", "-"], bare
+    assert all(isinstance(token, str) for token in argv)
+
+    # ultima camada: uma porta bloqueada que "escape" da validacao e recusada no argv
+    sneaky = ft.validate_request({"node_port": 15000})
+    sneaky["server_port"] = 1222
+    try:
+        ft.build_argv(sneaky, "t")
+        raise AssertionError("porta 1222 injetada deveria ser recusada no argv")
+    except ft.RequestError as exc:
+        assert exc.status == "blocked", exc.status
+    print("OK: argv como lista, '--' antes do filtro, 1222 recusada na ultima camada")
+
+
+def test_pcap_parsing():
+    print("== parsing de pcap ==")
+    a, b = "10.1.1.5", "10.1.1.10"
+    syn = ipv4_packet(a, b, tcp_segment(51000, 443, TCP_SYN))
+
+    # Ethernet + IPv4
+    pkt = one([eth(syn)])
+    assert pkt["src"] == "10.1.1.5.51000" and pkt["dst"] == "10.1.1.10.443", pkt
+    assert pkt["flags"] == "S" and pkt["flags_label"] == "SYN" and pkt["mti"] is None, pkt
+    assert pkt["markers_found"] == [], pkt
+
+    # Linux cooked (-i any), SLL e SLL2, big-endian, nanossegundos
+    assert one([sll(syn)], linktype=113)["flags_label"] == "SYN"
+    assert one([sll2(syn)], linktype=276)["flags_label"] == "SYN"
+    assert one([eth(syn)], endian=">")["flags_label"] == "SYN"
+    assert one([eth(syn)], magic=0xA1B23C4D)["flags_label"] == "SYN"
+    assert one([syn], linktype=101)["flags_label"] == "SYN"
+    assert one([eth(syn, vlan=100)])["flags_label"] == "SYN"
+
+    # flags
+    for flag, label, raw in ((TCP_SYN_ACK, "SYN-ACK", "S."), (TCP_PSH_ACK, "PSH-ACK", "P."),
+                             (TCP_RST_ACK, "RST-ACK", "R."), (0x10, "ACK", "."),
+                             (0x04, "RST", "R"), (0x01, "FIN", "F"), (0x11, "FIN-ACK", "F.")):
+        p = one([eth(ipv4_packet(a, b, tcp_segment(1, 2, flag)))])
+        assert (p["flags"], p["flags_label"]) == (raw, label), (flag, p)
+
+    # ISO 8583 + opcoes TCP (data offset 8) + opcoes IP (IHL 6)
+    payload = iso_payload("0800", "301")
+    seg = tcp_segment(51000, 443, TCP_PSH_ACK, payload, options=b"\x01\x01\x08\x0a" + b"\x00" * 8)
+    iso = one([eth(ipv4_packet(a, b, seg, ihl_options=b"\x01\x01\x01\x00"))])
+    assert iso["mti"] == "0800" and iso["bit70"] == "301" and iso["bit70_desc"] == "Echo Test", iso
+    assert (iso["bit7"], iso["bit11"], iso["bit32"]) == ("0920140102", "000123", "123456"), iso
+    assert (iso["bit37"], iso["bit100"], iso["bit127"]) == ("000000000123", "12345", "123456789")
+    assert iso["is_echo_test"] and not iso["is_signon"] and not iso["is_signoff"], iso
+    assert iso["markers_found"][0] == "MTI:0800" and "NMIC:301" in iso["markers_found"], iso
+
+    # IPv6
+    v6 = ipv6_packet("2001:db8::1", "2001:db8::2", tcp_segment(40000, 443, TCP_PSH_ACK, payload))
+    p6 = one([eth(v6, ethertype=0x86DD)])
+    assert p6["src"] == "2001:db8::1.40000" and p6["mti"] == "0800", p6
+
+    # nao-ISO (SSH) nao gera MTI/bits/marcadores; padding de camada 2 e descartado
+    ssh = ipv4_packet(a, b, tcp_segment(40000, 22, TCP_PSH_ACK, b"SSH-2.0-OpenSSH_7.4\r\n"))
+    p_ssh = one([eth(ssh) + b"\x00" * 6])
+    assert p_ssh["mti"] is None and p_ssh["markers_found"] == [], p_ssh
+    assert p_ssh["payload_ascii_preview"] == "SSH-2.0-OpenSSH_7.4..", p_ssh["payload_ascii_preview"]
+
+    # fallback legado: payload curto com o token 0800
+    legacy = ipv4_packet(a, b, tcp_segment(40001, 9000, TCP_PSH_ACK, b"xx0800yy"))
+    assert one([eth(legacy)])["markers_found"] == ["request_0800(ascii)"]
+
+    # fragmento nao-inicial / UDP / ARP / lixo
+    frag = ipv4_packet(a, b, tcp_segment(1, 2, TCP_PSH_ACK, payload), frag=185)
+    pf = one([eth(frag)])
+    assert pf["mti"] is None and pf["flags_label"] == "UNKNOWN", pf
+    udp = one([eth(ipv4_packet(a, b, b"\x00" * 16, proto=17))])
+    assert udp["flags_label"] == "UNKNOWN" and udp["src"] == "10.1.1.5", udp
+    assert ft.parse_pcap(pcap([eth(b"\x00" * 28, ethertype=0x0806)])) == []
+    assert ft.parse_pcap(b"") == [] and ft.parse_pcap(b"not a pcap at all, nope" * 3) == []
+
+    # registro final truncado: o que veio antes ainda e devolvido
+    good = pcap([eth(syn), eth(syn)])
+    assert len(ft.parse_pcap(good)) == 2
+    assert len(ft.parse_pcap(good[:-10])) == 1
+    print("OK: Ethernet/SLL/SLL2/VLAN/raw, BE/ns, IPv6, opcoes IP/TCP, ISO, fallback, lixo")
+
+
+def test_summary():
+    print("== summarize ==")
+    a, b = "10.1.1.5", "10.1.1.10"
+    frames = [
+        eth(ipv4_packet(a, b, tcp_segment(1, 443, TCP_SYN))),
+        eth(ipv4_packet(b, a, tcp_segment(443, 1, TCP_SYN_ACK))),
+        eth(ipv4_packet(a, b, tcp_segment(1, 443, TCP_PSH_ACK, iso_payload("0800", "301")))),
+        eth(ipv4_packet(b, a, tcp_segment(443, 1, TCP_PSH_ACK, iso_payload("0810", "301")))),
+        eth(ipv4_packet(a, b, tcp_segment(1, 443, TCP_PSH_ACK, iso_payload("0800", "001")))),
+        eth(ipv4_packet(b, a, tcp_segment(443, 1, TCP_RST_ACK))),
+    ]
+    summary = ft.summarize(ft.parse_pcap(pcap(frames)))
+    assert summary["total_packets"] == 6 and summary["psh_ack"] == 3, summary
+    assert summary["mti_counts"] == {"0800": 2, "0810": 1}, summary
+    assert summary["network_codes"] == {"301": 2, "001": 1}, summary
+    assert (summary["echo_tests"], summary["signon"], summary["signoff"]) == (2, 1, 0), summary
+    assert summary["request_0800_count"] == 2 and summary["response_0810_count"] == 1, summary
+    print("OK:", summary)
+
+
+def test_parity_with_agent_parser():
+    print("== paridade com src/tcpdump_parser.py (parser de texto do agente) ==")
+    try:
+        from src import _selftest as st
+        from src import tcpdump_parser as tp
+    except ImportError as exc:
+        print("PULADO (rode a partir da raiz do repo com PYTHONPATH=.): %s" % exc)
+        return
+
+    a, b = "10.1.1.5", "10.1.1.10"
+    spec = [  # src, dst, sport, dport, flag_txt, flags, payload
+        (a, b, 51000, 443, "S", TCP_SYN, b""),
+        (b, a, 443, 51000, "S.", TCP_SYN_ACK, b""),
+        (a, b, 51000, 443, "P.", TCP_PSH_ACK, iso_payload("0800", "301")),
+        (b, a, 443, 51000, "P.", TCP_PSH_ACK, iso_payload("0810", "301")),
+        (a, b, 51000, 443, "P.", TCP_PSH_ACK, iso_payload("0800", "001", bit11="000124")),
+        (a, b, 40000, 22, "P.", TCP_PSH_ACK, b"SSH-2.0-OpenSSH_7.4\r\n"),
+        (a, b, 40001, 9000, "P.", TCP_PSH_ACK, b"xx0800yy"),
+        (b, a, 443, 51000, "R.", TCP_RST_ACK, b""),
+    ]
+    text, frames = "", []
+    for index, (src, dst, sport, dport, flag_txt, flags, payload) in enumerate(spec):
+        text += st._entry("14:01:%02d.000000" % index, src, sport, dst, dport, flag_txt, flags, payload)
+        frames.append(eth(st._build_ipv4_tcp_packet(src, dst, sport, dport, flags, payload)))
+
+    agent = tp.parse_tcpdump_output(text)
+    onbox = ft.parse_pcap(pcap(frames))
+    assert len(agent) == len(onbox) == len(spec), (len(agent), len(onbox))
+
+    keys = ("src", "dst", "flags", "flags_label", "mti", "bit7", "bit11", "bit32", "bit37",
+            "bit70", "bit70_desc", "bit100", "bit127", "is_echo_test", "is_signon",
+            "is_signoff", "markers_found")
+    for index, (left, right) in enumerate(zip(agent, onbox)):
+        for key in keys:
+            assert left[key] == right[key], (index, key, left[key], right[key])
+    assert tp.summarize(agent) == ft.summarize(onbox), (tp.summarize(agent), ft.summarize(onbox))
+    print("OK: %d pacotes - todos os campos e o summarize identicos aos do agente" % len(spec))
+
+
+FAKE_TCPDUMP = """#!/usr/bin/env python3
+import json, os, sys, time
+sc = json.load(open(os.environ["FAKE_SCENARIO"]))
+if sc.get("record"):
+    json.dump(sys.argv, open(sc["record"], "w"))
+sys.stderr.write(sc.get("stderr", "")); sys.stderr.flush()
+data = open(sc["pcap"], "rb").read() if sc.get("pcap") else b""
+sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
+if sc.get("sleep"):
+    time.sleep(sc["sleep"])
+sys.exit(sc.get("exit", 0))
+"""
+
+
+def make_fake(workdir):
+    path = os.path.join(workdir, "fake_tcpdump")
+    with open(path, "w") as handle:
+        handle.write(FAKE_TCPDUMP)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    return path
+
+
+def set_scenario(workdir, **scenario):
+    path = os.path.join(workdir, "scenario.json")
+    with open(path, "w") as handle:
+        json.dump(scenario, handle)
+    os.environ["FAKE_SCENARIO"] = path
+    return scenario
+
+
+def fake_proc_dir(workdir, comms):
+    proc = os.path.join(workdir, "proc")
+    os.makedirs(proc)
+    for index, comm in enumerate(comms):
+        os.makedirs(os.path.join(proc, str(100 + index)))
+        with open(os.path.join(proc, str(100 + index), "comm"), "w") as handle:
+            handle.write(comm + "\n")
+    os.makedirs(os.path.join(proc, "999"))        # pid sem comm (terminou no meio)
+    os.makedirs(os.path.join(proc, "self_dir"))   # nao numerico
+    return proc
+
+
+def test_run_end_to_end():
+    print("== run() ponta a ponta com tcpdump falso ==")
+    work = fresh_dir()
+    fake = make_fake(work)
+    lock_dir = os.path.join(work, "locks")
+    proc = fake_proc_dir(work, ["bash", "sshd"])
+    record = os.path.join(work, "argv.json")
+
+    a, b = "10.100.1.20", "10.100.2.1"
+    frames = [eth(ipv4_packet(a, b, tcp_segment(2264, 15000, TCP_SYN))),
+              eth(ipv4_packet(a, b, tcp_segment(3264, 15000, TCP_RST_ACK))),
+              eth(ipv4_packet(a, b, tcp_segment(2265, 15000, TCP_PSH_ACK, iso_payload("0800", "301"))))]
+    pcap_path = os.path.join(work, "cap.pcap")
+    with open(pcap_path, "wb") as handle:
+        handle.write(pcap(frames))
+
+    common = dict(tcpdump_bin=fake, lock_dir=lock_dir, proc_dir=proc, audit=False)
+
+    # 1) caminho feliz
+    set_scenario(work, pcap=pcap_path, record=record,
+                 stderr="tcpdump: listening on any\n3 packets captured\n")
+    t0 = time.time()
+    result = ft.run({"node_port": 15000, "host": b, "count": 10, "timeout_sec": 5}, **common)
+    assert result["status"] == "ok", result
+    assert result["exit_status"] == 0 and result["timed_out"] is False, result
+    assert result["summary"]["syn"] == 1 and result["summary"]["rst_ack"] == 1, result["summary"]
+    assert result["summary"]["syn_ack"] == 0 and result["summary"]["echo_tests"] == 1
+    assert len(result["packets"]) == 3 and result["warnings"] == [], result
+    with open(record) as handle:
+        argv = json.load(handle)
+    assert argv[1:] == ["-nn", "-U", "-s", "512", "-c", "10", "-i", "any", "-w", "-", "--",
+                        "port", "15000", "and", "host", b], argv
+    assert result["command"].endswith("port 15000 and host " + b), result["command"]
+    assert time.time() - t0 < 5
+
+    # 2) 1222 pedida -> bloqueada e o tcpdump NUNCA e executado
+    os.remove(record)
+    blocked = ft.run({"node_port": 1222}, **common)
+    assert blocked == {"status": "blocked", "message": BLOCKED_MESSAGE}, blocked
+    assert not os.path.exists(record), "tcpdump nao pode ser executado para a 1222"
+
+    # 3) estouro de prazo -> exit 124, pacotes ja emitidos continuam aproveitados
+    set_scenario(work, pcap=pcap_path, sleep=30)
+    t0 = time.time()
+    slow = ft.run({"node_port": 15000, "timeout_sec": 1}, **common)
+    elapsed = time.time() - t0
+    assert slow["status"] == "ok" and slow["exit_status"] == 124 and slow["timed_out"], slow
+    assert len(slow["packets"]) == 3 and elapsed < 8, (len(slow["packets"]), elapsed)
+
+    # 4) aviso do TMOS no stderr vira warning explicito
+    set_scenario(work, pcap=pcap_path,
+                 stderr="WARNING - The recommended number of tmm tcpdump instances (2) "
+                        "has been exceeded (2).\n")
+    warned = ft.run({"node_port": 15000}, **common)
+    assert warned["status"] == "ok" and len(warned["warnings"]) == 1, warned
+    assert "tmm tcpdump instances" in warned["warnings"][0]
+
+    # 5) concorrencia: 1 rodando -> ok; 2 rodando -> busy, sem executar
+    set_scenario(work, pcap=pcap_path, record=record)
+    if os.path.exists(record):
+        os.remove(record)
+    one_running = fake_proc_dir(fresh_dir(), ["tcpdump", "bash"])
+    assert ft.run({"node_port": 15000}, **dict(common, proc_dir=one_running))["status"] == "ok"
+    os.remove(record)
+    two_running = fake_proc_dir(fresh_dir(), ["tcpdump", "tcpdump", "sshd"])
+    assert ft.count_running_tcpdump(two_running) == 2
+    busy = ft.run({"node_port": 15000}, **dict(common, proc_dir=two_running))
+    assert busy["status"] == "busy" and busy["retry_after_minutes"] == 5, busy
+    assert "5 minutos" in busy["message"] and "tcpdump" in busy["message"], busy["message"]
+    assert not os.path.exists(record), "nada pode ser iniciado quando esta no teto"
+
+    # 6) guarda atomica ocupada por outra chamada -> busy, sem esperar para sempre
+    import fcntl
+    os.makedirs(lock_dir, exist_ok=True)
+    holder = os.open(os.path.join(lock_dir, "guard.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        t0 = time.time()
+        contended = ft.run({"node_port": 15000}, **dict(common, guard_wait_sec=0.3))
+        assert contended["status"] == "busy", contended
+        assert time.time() - t0 < 3
+    finally:
+        os.close(holder)
+
+    # 7) tcpdump ausente -> erro claro (sem excecao)
+    missing = ft.run({"node_port": 15000}, tcpdump_bin=os.path.join(work, "nao_existe"),
+                     lock_dir=lock_dir, proc_dir=proc, audit=False)
+    assert missing["status"] == "error", missing
+    print("OK: feliz / 1222 / timeout 124 / warning TMM / teto / guarda / binario ausente")
+
+
+def test_cli():
+    print("== CLI (JSON no stdin / --request) ==")
+    proc = subprocess.Popen([sys.executable, SCRIPT], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, _ = proc.communicate(json.dumps({"server_port": 1222}).encode())
+    assert proc.returncode == 0, proc.returncode
+    assert json.loads(out.decode("utf-8")) == {"status": "blocked", "message": BLOCKED_MESSAGE}
+
+    done = subprocess.run([sys.executable, SCRIPT, "--request", '{"host": "nao-e-ip"}'],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert json.loads(done.stdout.decode("utf-8"))["status"] == "invalid"
+
+    bad = subprocess.run([sys.executable, SCRIPT], input=b"{nao e json",
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert bad.returncode == 2 and json.loads(bad.stdout.decode("utf-8"))["status"] == "invalid"
+    print("OK: bloqueio e erros de entrada pela CLI, com JSON em todos os casos")
+
+
+def test_py27_lint():
+    print("== lint de compatibilidade com Python 2.7 (estatico) ==")
+    with open(SCRIPT, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+
+    banned_nodes = (ast.JoinedStr, ast.AnnAssign, ast.Nonlocal, ast.YieldFrom,
+                    ast.AsyncFunctionDef, ast.Await, ast.NamedExpr, ast.MatMult)
+    banned_names = {"removeprefix", "removesuffix", "monotonic", "DEVNULL", "JSONDecodeError",
+                    "from_bytes", "to_bytes", "dataclass", "exist_ok"}
+    allowed_imports = {"__future__", "binascii", "errno", "fcntl", "json", "numbers", "os",
+                       "re", "socket", "struct", "subprocess", "sys", "syslog", "threading",
+                       "time"}
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, banned_nodes):
+            problems.append("%s (linha %d)" % (type(node).__name__, node.lineno))
+        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+            args = node.args
+            if args.kwonlyargs or args.posonlyargs:
+                problems.append("args keyword-only/posonly (linha %d)" % node.lineno)
+            if isinstance(node, ast.FunctionDef):
+                if node.returns is not None or any(a.annotation for a in args.args):
+                    problems.append("anotacao de tipo em %s" % node.name)
+        if isinstance(node, ast.Attribute) and node.attr in banned_names:
+            problems.append("atributo %s (linha %d)" % (node.attr, node.lineno))
+        if isinstance(node, ast.Attribute) and node.attr == "run" and \
+                isinstance(node.value, ast.Name) and node.value.id == "subprocess":
+            problems.append("subprocess.run (3.5+) linha %d" % node.lineno)
+        if isinstance(node, ast.keyword) and node.arg in ("timeout", "input", "capture_output"):
+            problems.append("kwarg %s (3.x) linha %d" % (node.arg, node.value.lineno))
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in allowed_imports:
+                    problems.append("import %s" % alias.name)
+        if isinstance(node, ast.ImportFrom) and node.module not in allowed_imports:
+            problems.append("from %s import" % node.module)
+    assert not problems, problems
+    print("OK: sem f-string/anotacoes/dataclass/typing/subprocess.run; so stdlib permitida")
+    print("   (checagem estatica - NAO substitui rodar num interpretador 2.7 real)")
+
+
+def main():
+    test_validation()
+    test_build_argv()
+    test_pcap_parsing()
+    test_summary()
+    test_parity_with_agent_parser()
+    test_run_end_to_end()
+    test_cli()
+    test_py27_lint()
+    print("\nTODOS OS TESTES ON-BOX PASSARAM")
+
+
+if __name__ == "__main__":
+    main()
