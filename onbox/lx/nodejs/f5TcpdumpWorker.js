@@ -93,7 +93,7 @@ F5TcpdumpWorker.prototype.onGet = function (restOperation) {
         usage: "POST neste caminho com um objeto JSON; se a captura demorar, a resposta " +
             "e 202 com job_id e o resultado sai em GET " + BASE_PATH + "?job_id=<job_id>",
         fields: ["interface", "server_port", "node_port", "host", "count", "timeout_sec",
-            "vs_addr", "verbose", "detalhes", "stan"],
+            "vs_addr", "client_addr", "node_addr", "verbose", "detalhes", "stan"],
         status_values: Object.keys(HTTP_BY_STATUS),
         http_status: HTTP_BY_STATUS,
         async: {

@@ -436,17 +436,20 @@ def focus_vs_traffic(
 
     Só descarta quando o lado da VS é identificável: `vs_addr` + `server_port`, ou
     `server_port` diferente de `node_port`. Sem isso (ex: só a porta do node) nada é
-    descartado. Devolve (pacotes mantidos, info)."""
-    info = {"separated": False, "probe_flows": 0, "probe_packets": 0}
+    descartado. Uma perna do node só fica se for de uma conexão da VS (mesmo STAN ou
+    mesma porta efêmera do cliente, que o F5 preserva no SNAT); o resto é de outra VS
+    que divide o IP da VS ou o node (ex: VS :15000 no mesmo IP, pool com o mesmo
+    member) e é descartado. Devolve (pacotes mantidos, info)."""
+    info = {"separated": False, "probe_flows": 0, "probe_packets": 0,
+            "other_flows": 0, "other_packets": 0}
     if server_port is not None and vs_addr is not None:
         vs_endpoint = f"{vs_addr}.{server_port}"
 
-        def is_vs_side(pkt: dict) -> bool:
-            return vs_endpoint in (pkt["src"], pkt["dst"])
+        def is_vs_endpoint(endpoint: str) -> bool:
+            return endpoint == vs_endpoint
     elif server_port is not None and node_port is not None and server_port != node_port:
-        def is_vs_side(pkt: dict) -> bool:
-            return server_port in (_endpoint_parts(pkt["src"])[1],
-                                   _endpoint_parts(pkt["dst"])[1])
+        def is_vs_endpoint(endpoint: str) -> bool:
+            return _endpoint_parts(endpoint)[1] == server_port
     else:
         return list(packets), info
 
@@ -455,18 +458,30 @@ def focus_vs_traffic(
     for pkt in packets:
         flows.setdefault(_flow_key(pkt), []).append(pkt)
 
-    keep = set()
+    vs_flows = set()
+    vs_stans = set()
+    client_ports = set()
     for key, pkts in flows.items():
-        probe = (
-            not any(is_vs_side(p) for p in pkts)
-            and all(p.get("payload_len", 0) == 0 and not p.get("mti")
+        if any(is_vs_endpoint(e) for e in key):
+            vs_flows.add(key)
+            vs_stans.update(p["bit11"] for p in pkts if p.get("mti") and p.get("bit11"))
+            client_ports.update(_endpoint_parts(e)[1] for e in key if not is_vs_endpoint(e))
+
+    keep = set(vs_flows)
+    for key, pkts in flows.items():
+        if key in vs_flows:
+            continue
+        probe = all(p.get("payload_len", 0) == 0 and not p.get("mti")
                     and p["flags_label"] in _PROBE_LABELS for p in pkts)
-        )
         if probe:
             info["probe_flows"] += 1
             info["probe_packets"] += len(pkts)
-        else:
+        elif (any(p.get("bit11") in vs_stans for p in pkts if p.get("mti") and p.get("bit11"))
+              or any(_endpoint_parts(e)[1] in client_ports for e in key)):
             keep.add(key)
+        else:
+            info["other_flows"] += 1
+            info["other_packets"] += len(pkts)
     return [p for p in packets if _flow_key(p) in keep], info
 
 
@@ -644,6 +659,10 @@ def simplified_view(
         notes.append(
             f"{info['probe_flows']} sonda(s) do monitor do pool "
             f"({info['probe_packets']} pacotes) foram ignoradas: não são tráfego da VS.")
+    if info["other_flows"]:
+        notes.append(
+            f"{info['other_flows']} conexão(ões) de outra(s) VS que dividem o IP da VS ou o "
+            f"node ({info['other_packets']} pacotes) foram ignoradas: não são da VS pedida.")
     if not info["separated"] and kept:
         notes.append(
             "Não foi possível separar o tráfego da VS do restante (informe vs_addr junto "

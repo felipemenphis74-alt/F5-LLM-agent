@@ -16,7 +16,15 @@ Entrada (JSON, stdin ou `--request`): todos opcionais
 | `host` | string | só IPv4/IPv6 literal (sem DNS) |
 | `count` | int 1–500 | padrão 100 |
 | `timeout_sec` | int 1–180 | padrão 20 |
-| `vs_addr` | string | IPv4/IPv6 literal da VS. **Não entra no filtro**: só permite, junto de `server_port`, separar na resposta o tráfego da VS das sondas do monitor do pool |
+| `vs_addr` | string | IPv4/IPv6 literal da VS. Com `server_port`, a perna do cliente vira `port <server_port> and host <vs_addr>` e a resposta separa o tráfego da VS (descarta sondas do monitor e conexões de outra VS no mesmo IP) |
+| `client_addr` | string | IPv4/IPv6 literal do cliente; exige `server_port`. Acrescenta `and host <client_addr>` à perna do cliente |
+| `node_addr` | string | IPv4/IPv6 literal do pool member; exige `node_port`. Perna do servidor vira `port <node_port> and host <node_addr>` |
+
+Filtro com IP por perna: `(port 17000 and host 10.100.1.10 [and host <cliente>]) or (port 15000 and host 192.168.0.9)`.
+`host` (legado) continua fazendo AND com o filtro inteiro. Mesmo com o filtro por perna, um
+member usado por várias VS traz a perna do servidor das outras: a resposta mantém só as
+conexões do node ligadas à VS (mesmo STAN ou mesma porta efêmera do cliente) e avisa
+quantas de outra VS foram ignoradas.
 | `verbose` | bool | `false` (padrão) = resposta simples; `true` = retorno completo, para depurar |
 | `detalhes` | bool | `true` = cada transação traz `campos`, `trajeto`, `saltos`, `rtt_ms` e a resposta inclui `tabela_markdown` |
 | `stan` | string 1–12 dígitos | com `detalhes`, restringe às transações com esse STAN (bit 11) |
@@ -127,7 +135,7 @@ TOKEN=$(curl -sk -X POST https://<mgmt>/mgmt/shared/authn/login -H 'Content-Type
         -d '{"username":"<u>","password":"<p>","loginProviderName":"tmos"}' | jq -r .token.token)
 curl -sk -X POST https://<mgmt>/mgmt/shared/f5_tcpdump -H "X-F5-Auth-Token: $TOKEN" \
      -H 'Content-Type: application/json' \
-     -d '{"server_port":17000,"node_port":15000,"host":"192.168.0.9","timeout_sec":180}'
+     -d '{"server_port":17000,"vs_addr":"10.100.1.10","node_port":15000,"node_addr":"192.168.0.9","timeout_sec":180}'
 #   -> 202 {"status":"running","job_id":"…","poll":"/mgmt/shared/f5_tcpdump?job_id=…"}
 curl -sk "https://<mgmt>/mgmt/shared/f5_tcpdump?job_id=<id>" -H "X-F5-Auth-Token: $TOKEN"
 ```
