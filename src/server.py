@@ -215,10 +215,28 @@ def tcpdump_validate_traffic(
     client_addr: Optional[str] = None,
     vs_addr: Optional[str] = None,
     node_addr: Optional[str] = None,
+    verbose: bool = False,
+    detalhes: bool = False,
+    stan: Optional[str] = None,
 ) -> dict:
     """Executa uma captura tcpdump somente-leitura no BIG-IP (via SSH, sem gravar
     .pcap) filtrando por porta de servidor (VS), porta de node/pool member e pelos
     IPs de cada lado da conexão.
+
+    RETORNO SIMPLES (padrão): `resultado` (veredito em uma frase), `trafego` (contagens
+    só da VS pedida), `transacoes` (ISO 8583 agrupadas por STAN: pedido/resposta),
+    `janela` e `avisos`. Sondas do monitor do pool e conexões que não são da VS
+    pedida NÃO entram — só é descartado quando o lado da VS é identificável (`vs_addr`
+    + `server_port`, ou portas de VS e node diferentes). `verbose=True` devolve o
+    retorno completo (comando, summary, até 200 pacotes brutos, stderr) — use só para
+    depurar a ferramenta, não para responder ao usuário.
+
+    DETALHES DAS TRANSAÇÕES: quando o usuário pedir os detalhes das transações
+    capturadas, chame com `detalhes=True` (e `stan="<STAN>"` para uma só). Cada
+    transação passa a trazer `campos` (bits ISO 8583), `trajeto` (os saltos), `saltos`
+    e `rtt_ms`, e a resposta inclui `tabela_markdown`: apresente-a COMO ESTÁ (tabela
+    "# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio" + observações), sem
+    reformatar e sem acrescentar pacotes brutos.
 
     SEJA ESPECÍFICO: quando o IP e a porta da conexão a validar já estiverem
     confirmados (ex: lidos da config da VS/pool), passe-os — `vs_addr` (+
@@ -258,7 +276,8 @@ def tcpdump_validate_traffic(
     return _run_capture(
         _client_for(device), interface=interface, count=count, timeout_sec=timeout_sec,
         server_port=server_port, node_port=node_port, host=host,
-        client_addr=client_addr, vs_addr=vs_addr, node_addr=node_addr,
+        client_addr=client_addr, vs_addr=vs_addr, node_addr=node_addr, verbose=verbose,
+        detalhes=detalhes, stan=stan,
     )
 
 
@@ -274,9 +293,12 @@ def _run_capture(
     vs_addr: Optional[str] = None,
     node_addr: Optional[str] = None,
     node_members: Optional[list[tuple[str, int]]] = None,
+    verbose: bool = False,
+    detalhes: bool = False,
+    stan: Optional[str] = None,
 ) -> dict:
     """Executa a captura e monta o retorno estruturado (comum às ferramentas de
-    tcpdump)."""
+    tcpdump). Padrão: retorno simples só com o tráfego da VS; `verbose` = completo."""
     inv = _get_inventory()
     try:
         result = client.tcpdump_capture(
@@ -332,6 +354,26 @@ def _run_capture(
             "nessas portas, inclusive de outras conexões. Com IP e porta confirmados, "
             "repita com vs_addr/client_addr/node_addr para capturar só a conexão validada."
         )
+    if not verbose:
+        view, notes = tcpdump_parser.simplified_view(
+            packets, server_port=server_port, node_port=node_port, vs_addr=vs_addr,
+            detalhes=detalhes, stan=stan)
+        window = min(timeout_sec, inv.limits.tcpdump_max_duration_sec)
+        simple = {
+            "status": "ok",
+            "resultado": view["resultado"],
+            "janela": {"max_s": window,
+                       "encerrou_por": "prazo" if result.exit_status == 124
+                       else "limite de pacotes"},
+            "trafego": view["trafego"],
+            "transacoes": view["transacoes"],
+            "avisos": warnings + notes,
+        }
+        if "transacoes_omitidas" in view:
+            simple["transacoes_omitidas"] = view["transacoes_omitidas"]
+        if "tabela_markdown" in view:
+            simple["tabela_markdown"] = view["tabela_markdown"]
+        return simple
     return {
         "status": "ok",
         "command": result.command,
@@ -360,10 +402,24 @@ def tcpdump_capture_connection(
     interface: str = "0.0",
     count: int = 100,
     timeout_sec: int = 20,
+    verbose: bool = False,
+    detalhes: bool = False,
+    stan: Optional[str] = None,
 ) -> dict:
     """Captura (tcpdump, somente leitura) SÓ o tráfego da conexão que o usuário
     pediu — use esta ferramenta sempre que o pedido citar uma conexão pelo nome
     (ex: "a conexão da Padaria do Zezinho"), em vez de montar filtros por porta.
+
+    RETORNO SIMPLES (padrão): `conexao` (VS, IP:porta, pool, members), `resultado`
+    (veredito em uma frase), `trafego`, `transacoes` (ISO 8583 por STAN) e `avisos` —
+    só do tráfego da VS pedida; sondas do monitor do pool não aparecem. `verbose=True`
+    devolve o retorno completo (comando, summary, pacotes brutos, stderr), só para
+    depurar a ferramenta.
+
+    DETALHES DAS TRANSAÇÕES: se o usuário pedir os detalhes, chame com `detalhes=True`
+    (e `stan="<STAN>"` para uma só): cada transação traz `campos` ISO 8583, `trajeto`,
+    `saltos` e `rtt_ms`, e a resposta inclui `tabela_markdown` — apresente-a como está
+    (tabela "# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio" + observações).
 
     `connection` = o nome da conexão como o usuário disse (ex: "padaria do zezinho"),
     sem palavras de contexto como "conexão"/"captura". Ele é procurado no nome, na
@@ -452,19 +508,37 @@ def tcpdump_capture_connection(
         result = _run_capture(
             client, interface=interface, count=count, timeout_sec=timeout_sec,
             server_port=vs_port, vs_addr=vs_addr, client_addr=client_addr,
-            node_members=node_members,
+            node_members=node_members, verbose=verbose, detalhes=detalhes, stan=stan,
         )
     except UnsafeInputError as exc:
         # IP/porta lidos do F5 que não passam na validação (ex: member em IPv6 com
         # rota-domínio "%1") — não captura no escuro, devolve o motivo.
         return {"status": "error", "connection": connection_info, "message": str(exc)}
-    result["connection"] = connection_info
+    if verbose:
+        result["connection"] = connection_info
+    else:
+        compact = {
+            "vs": connection_info["vs_name"],
+            "descricao": connection_info.get("description"),
+            "vs_ip_porta": f"{vs_addr}:{vs_port}",
+            "pool": connection_info.get("pool_name"),
+            "membros": connection_info["pool_members"],
+            "cliente": client_addr,
+        }
+        result = {"conexao": {k: v for k, v in compact.items() if v}, **result}
     if shared and result.get("status") == "ok":
-        result["warnings"].append(
-            "Pool member compartilhado com outra(s) VS: " + "; ".join(shared) + ". No lado "
-            "servidor o tráfego dessas VS tem o mesmo IP/porta/SNAT e pode aparecer na "
-            "captura — o lado cliente (IP:porta da VS) é exclusivo desta conexão."
-        )
+        if verbose:
+            result["warnings"].append(
+                "Pool member compartilhado com outra(s) VS: " + "; ".join(shared) + ". No "
+                "lado servidor o tráfego dessas VS tem o mesmo IP/porta/SNAT e pode aparecer "
+                "na captura — o lado cliente (IP:porta da VS) é exclusivo desta conexão."
+            )
+        else:
+            # resposta simples: sem nomear outras VS/pools — só o limite que afeta a leitura
+            result["avisos"].append(
+                "O pool member é compartilhado com outra VS: no lado do node podem aparecer "
+                "conexões dela (mesmo IP/porta/SNAT); o lado cliente é exclusivo desta VS."
+            )
     return result
 
 

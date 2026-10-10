@@ -1,6 +1,7 @@
 """Auto-teste rápido (sem F5 real) dos parsers e das camadas de segurança.
 Roda dentro do container: docker run --rm --entrypoint python f5-mcp-agent:test -m src._selftest
 """
+import json
 import shlex
 import shutil
 import socket
@@ -436,12 +437,73 @@ def run():
     print("== server: captura só por porta avisa que é abrangente ==")
     server._client_for = lambda device: FakeClient(0)
     broad = server.tcpdump_validate_traffic("f5-selftest", server_port=17000, node_port=15000)
-    assert any("Captura abrangente" in w for w in broad["warnings"]), broad["warnings"]
+    assert any("Captura abrangente" in w for w in broad["avisos"]), broad["avisos"]
+    broad_full = server.tcpdump_validate_traffic(
+        "f5-selftest", server_port=17000, node_port=15000, verbose=True)
+    assert any("Captura abrangente" in w for w in broad_full["warnings"]), broad_full["warnings"]
     narrow = server.tcpdump_validate_traffic(
         "f5-selftest", server_port=17000, vs_addr="10.100.1.10",
         node_port=15000, node_addr="192.168.0.9")
-    assert narrow["warnings"] == [], narrow["warnings"]
-    print("OK: porta sem IP -> warning; IP+porta nos dois lados -> sem warning")
+    assert narrow["avisos"] == [], narrow["avisos"]
+    print("OK: porta sem IP -> aviso; IP+porta nos dois lados -> sem aviso")
+
+    print("== server: resposta simples só do tráfego da VS (sem sondas do monitor) ==")
+    probe_text = (
+        _entry("14:10:00.000100", "192.168.0.9", 50000, "10.100.1.10", 17000, "S", TCP_SYN)
+        + _entry("14:10:00.000200", "10.100.1.10", 17000, "192.168.0.9", 50000, "S.", TCP_SYN_ACK)
+        + _entry("14:10:00.001000", "192.168.0.9", 50000, "10.100.1.10", 17000, "P.",
+                 TCP_PSH_ACK, _iso_payload("0800", "301", bit11="111111"))
+        + _entry("14:10:00.001500", "10.100.1.10", 17000, "192.168.0.9", 50000, "P.",
+                 TCP_PSH_ACK, _iso_payload("0810", "301", bit11="111111"))
+        + _entry("14:10:01.000000", "10.100.1.20", 4321, "192.168.0.9", 15000, "S", TCP_SYN)
+        + _entry("14:10:01.000100", "192.168.0.9", 15000, "10.100.1.20", 4321, "S.", TCP_SYN_ACK)
+        + _entry("14:10:01.000200", "10.100.1.20", 4321, "192.168.0.9", 15000, "R", 0x04)
+    )
+
+    class TextClient:
+        def tcpdump_capture(self, **kwargs):
+            return CommandResult(command="tcpdump ...", stdout=probe_text, stderr="",
+                                 exit_status=124)
+
+    server._client_for = lambda device: TextClient()
+    scope = dict(server_port=17000, vs_addr="10.100.1.10", node_port=15000,
+                 node_addr="192.168.0.9")
+    simple = server.tcpdump_validate_traffic("f5-selftest", **scope)
+    assert simple["status"] == "ok", simple
+    for noisy in ("command", "packets", "stderr", "summary", "exit_status"):
+        assert noisy not in simple, noisy
+    assert simple["transacoes"] == [{
+        "hora": "14:10:00.001000", "stan": "111111", "pedido": "0800", "resposta": "0810",
+        "tipo": "Echo Test", "origem": "192.168.0.9", "respondida": True}], simple["transacoes"]
+    assert simple["trafego"]["pacotes"] == 4 and simple["trafego"]["syn_ack"] == 1, simple["trafego"]
+    assert simple["janela"] == {"max_s": 20, "encerrou_por": "prazo"}, simple["janela"]
+    assert any("1 sonda(s)" in a for a in simple["avisos"]), simple["avisos"]
+    full = server.tcpdump_validate_traffic("f5-selftest", **scope, verbose=True)
+    assert full["summary"]["total_packets"] == 7 and len(full["packets"]) == 7, full["summary"]
+    assert "command" in full and "stderr" in full
+    print("OK: 4 pacotes da VS + 1 transação por STAN; sonda ignorada (avisada); verbose volta tudo")
+
+    print("== server: detalhes=True devolve a tabela no padrão pedido ==")
+    detailed_view = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True)
+    assert detailed_view["status"] == "ok", detailed_view
+    lines = detailed_view["tabela_markdown"].splitlines()
+    assert lines[0] == "**Transações (VS 10.100.1.10:17000)** — 1 respondida(s) de 1", lines[0]
+    assert lines[2] == "| # | Tipo | STAN | Enviada | Resposta | RTT | Rastreio |", lines[2]
+    assert lines[4].startswith("| 1 | 0800 | 111111 | 14:10:00.001 | 0810 / 111111 | ") and \
+        lines[4].endswith(" ms | 2/4 |"), lines[4]
+    tx = detailed_view["transacoes"][0]
+    assert tx["campos"]["bit11"] == "111111" and tx["campos"]["bit70"] == "301", tx
+    assert [h["mti"] for h in tx["trajeto"]] == ["0800", "0810"] and tx["saltos"] == 2, tx
+    assert tx["rtt_ms"] == 0 or tx["rtt_ms"] == 1, tx   # 14:10:00.001000 -> .001500
+    for leak in ("payload", "packets", "command", "stderr"):
+        assert leak not in json.dumps(detailed_view), leak
+    only = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True, stan="111111")
+    assert [t["stan"] for t in only["transacoes"]] == ["111111"], only
+    nothing = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True, stan="000000")
+    assert nothing["transacoes"] == [] and "tabela_markdown" not in nothing, nothing
+    assert "tabela_markdown" not in simple and "campos" not in simple["transacoes"][0]
+    print("OK: tabela '# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio' + campos/trajeto/RTT; "
+          "filtro por STAN; resposta simples inalterada")
 
     print("== tmsh parser: descrição, destino numérico e members do `list` ==")
     vs_all = tmsh_parser.parse_virtual_servers(SAMPLE_VS_LIST)
@@ -502,8 +564,18 @@ def run():
         (17000, "10.100.1.10", "192.168.170.1"), sent
     assert sent["node_members"] == [("192.168.0.9", 15000)], sent  # IP do node "web01" via `list`
     assert sent["node_port"] is None and sent["node_addr"] is None and sent["host"] is None, sent
-    assert out["connection"]["pool_members"] == ["192.168.0.9:15000"], out["connection"]
-    assert any("vs_app1_15000" in w and "compartilhado" in w for w in out["warnings"]), out
+    assert out["conexao"]["membros"] == ["192.168.0.9:15000"], out["conexao"]
+    assert out["conexao"]["vs_ip_porta"] == "10.100.1.10:17000", out["conexao"]
+    shared_note = [w for w in out["avisos"] if "compartilhado" in w]
+    assert len(shared_note) == 1 and "vs_app1_15000" not in shared_note[0] and \
+        "pool_app1_15000" not in shared_note[0], shared_note  # sem nomear outra VS/pool
+    for noisy in ("command", "packets", "stderr", "summary", "connection", "warnings"):
+        assert noisy not in out, noisy
+    detailed = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho",
+                                                 client_addr="192.168.170.1", verbose=True)
+    assert detailed["connection"]["pool_members"] == ["192.168.0.9:15000"], detailed
+    assert any("vs_app1_15000" in w and "compartilhado" in w for w in detailed["warnings"]), detailed
+    assert "command" in detailed and "summary" in detailed
     # o filtro que o F5Client real monta para esses parâmetros
     client._run = fake_run
     client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,

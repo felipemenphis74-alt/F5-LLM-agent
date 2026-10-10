@@ -110,6 +110,7 @@ class ParsedPacket:
 
     payload_ascii: str = ""
     payload_hex: str = ""
+    payload_len: int = 0     # bytes de payload TCP (0 = segmento sem dados)
 
     mti: str | None = None
 
@@ -136,6 +137,7 @@ class ParsedPacket:
 
             "flags": self.flags_raw,
             "flags_label": self.flags_label,
+            "payload_len": self.payload_len,
 
             "mti": self.mti,
 
@@ -289,6 +291,7 @@ def parse_tcpdump_output(raw_output: str) -> list[dict]:
         current.payload_hex = " ".join(current_hex_parts)
 
         tcp_payload = _tcp_payload_hex(current.payload_hex)
+        current.payload_len = len(tcp_payload) // 2
         current.mti = _extract_mti(tcp_payload)
 
         # Só extrai os bits se o MTI confirmou que é uma mensagem ISO 8583 — senão
@@ -395,6 +398,258 @@ def summarize(packets: list[dict]) -> dict:
             summary["response_0810_count"] += 1
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Visão do usuário: só o tráfego da VS pedida + transações (resposta enxuta)
+# ---------------------------------------------------------------------------
+# ATENÇÃO: onbox/f5_tcpdump.py tem uma cópia desta lógica (o script no BIG-IP é um
+# arquivo único, só stdlib, compatível com Python 2.7); onbox/test_f5_tcpdump.py
+# confere a paridade das duas. Altere os dois juntos.
+
+MAX_TRANSACTIONS = 50
+# Fluxo do monitor do pool (tcp_half_open): só SYN / SYN-ACK / RST, sem handshake
+# completo, sem dados.
+_PROBE_LABELS = frozenset(("SYN", "SYN-ACK", "RST", "RST-ACK"))
+
+
+def _endpoint_parts(endpoint: str) -> tuple[str, int | None]:
+    host, _, port = endpoint.rpartition(".")
+    if host and port.isdigit():
+        return host, int(port)
+    return endpoint, None
+
+
+def _flow_key(pkt: dict) -> tuple:
+    return tuple(sorted((pkt["src"], pkt["dst"])))
+
+
+def focus_vs_traffic(
+    packets: list[dict],
+    server_port: int | None = None,
+    node_port: int | None = None,
+    vs_addr: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Mantém só o tráfego da VS pedida (o lado cliente e as pernas do node das
+    conexões dela) e descarta os fluxos do monitor do pool — SYN/SYN-ACK/RST sem dados
+    e sem handshake completo no lado do node, que não são conexões da aplicação.
+
+    Só descarta quando o lado da VS é identificável: `vs_addr` + `server_port`, ou
+    `server_port` diferente de `node_port`. Sem isso (ex: só a porta do node) nada é
+    descartado. Devolve (pacotes mantidos, info)."""
+    info = {"separated": False, "probe_flows": 0, "probe_packets": 0}
+    if server_port is not None and vs_addr is not None:
+        vs_endpoint = f"{vs_addr}.{server_port}"
+
+        def is_vs_side(pkt: dict) -> bool:
+            return vs_endpoint in (pkt["src"], pkt["dst"])
+    elif server_port is not None and node_port is not None and server_port != node_port:
+        def is_vs_side(pkt: dict) -> bool:
+            return server_port in (_endpoint_parts(pkt["src"])[1],
+                                   _endpoint_parts(pkt["dst"])[1])
+    else:
+        return list(packets), info
+
+    info["separated"] = True
+    flows: dict[tuple, list[dict]] = {}
+    for pkt in packets:
+        flows.setdefault(_flow_key(pkt), []).append(pkt)
+
+    keep = set()
+    for key, pkts in flows.items():
+        probe = (
+            not any(is_vs_side(p) for p in pkts)
+            and all(p.get("payload_len", 0) == 0 and not p.get("mti")
+                    and p["flags_label"] in _PROBE_LABELS for p in pkts)
+        )
+        if probe:
+            info["probe_flows"] += 1
+            info["probe_packets"] += len(pkts)
+        else:
+            keep.add(key)
+    return [p for p in packets if _flow_key(p) in keep], info
+
+
+def _is_response_mti(mti: str) -> bool:
+    return len(mti) == 4 and mti[2] in "13"
+
+
+ISO_BIT_FIELDS = ("bit7", "bit11", "bit32", "bit37", "bit70", "bit100", "bit127")
+EXPECTED_HOPS = 4   # cliente→VS, F5→node, node→F5, VS→cliente
+
+
+def _seconds(stamp: str) -> float | None:
+    """'HH:MM:SS.ffffff' -> segundos desde 00:00 (None se o formato não bater)."""
+    try:
+        hh, mm, ss = stamp.split(":")
+        return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except (ValueError, AttributeError):
+        return None
+
+
+def build_transactions(packets: list[dict], detail: bool = False) -> list[dict]:
+    """Agrupa as mensagens ISO 8583 em transações (pedido + resposta), pelo STAN
+    (bit 11). A mesma mensagem aparece em vários saltos (cliente→VS, F5→node...): conta
+    uma vez. Com `detail`, cada transação ganha `campos` (bits ISO), `trajeto` (os
+    saltos, em ordem), `saltos` (quantos) e `rtt_ms` (do pedido à resposta)."""
+    order: list[tuple] = []
+    groups: dict[tuple, dict] = {}
+    for pkt in packets:
+        mti = pkt.get("mti")
+        if not mti:
+            continue
+        stan = pkt.get("bit11")
+        if stan:
+            key = ("stan", stan)
+        else:  # sem STAN: agrupa por conexão + par pedido/resposta
+            key = ("flow", _flow_key(pkt), mti[:2] + mti[3:])
+        group = groups.get(key)
+        if group is None:
+            group = {"hora": pkt["time"], "stan": stan, "pedido": None, "resposta": None,
+                     "tipo": None, "origem": None}
+            if detail:
+                group.update(campos={b: pkt.get(b) for b in ISO_BIT_FIELDS}, trajeto=[],
+                             _req=None, _resp=None)
+            groups[key] = group
+            order.append(key)
+        response = _is_response_mti(mti)
+        if response:
+            group["resposta"] = group["resposta"] or mti
+        elif group["pedido"] is None:
+            group["pedido"] = mti
+            group["origem"] = _endpoint_parts(pkt["src"])[0]
+            group["hora"] = pkt["time"]
+        group["tipo"] = (group["tipo"] or pkt.get("bit70_desc")
+                         or MTI_DESCRIPTIONS.get(group["pedido"] or mti))
+        if detail:
+            group["trajeto"].append(
+                {"hora": pkt["time"], "de": pkt["src"], "para": pkt["dst"], "mti": mti})
+            moment = _seconds(pkt["time"])
+            if moment is not None:
+                if response:
+                    group["_resp"] = moment      # a ÚLTIMA resposta (VS→cliente)
+                elif group["_req"] is None:
+                    group["_req"] = moment       # o PRIMEIRO pedido (cliente→VS)
+    out = []
+    for key in order:
+        group = groups[key]
+        group["respondida"] = group["resposta"] is not None
+        if detail:
+            req, resp = group.pop("_req"), group.pop("_resp")
+            group["saltos"] = len(group["trajeto"])
+            group["rtt_ms"] = (round((resp - req) * 1000)
+                               if req is not None and resp is not None and resp >= req
+                               else None)
+        out.append(group)
+    return out
+
+
+def render_details_markdown(transactions: list[dict], vs_label: str) -> str:
+    """Tabela no padrão pedido pelo usuário (# | Tipo | STAN | Enviada | Resposta | RTT |
+    Rastreio) + observações — pronta para ser apresentada como está."""
+    total = len(transactions)
+    answered = sum(1 for t in transactions if t["respondida"])
+    lines = [f"**Transações ({vs_label})** — {answered} respondida(s) de {total}", "",
+             "| # | Tipo | STAN | Enviada | Resposta | RTT | Rastreio |",
+             "|---|---|---|---|---|---|---|"]
+    for number, t in enumerate(transactions, 1):
+        reply = f"{t['resposta']} / {t['stan']}" if t["resposta"] else "sem resposta"
+        rtt = f"{t['rtt_ms']:.0f} ms" if t.get("rtt_ms") is not None else "-"
+        lines.append("| %d | %s | %s | %s | %s | %s | %d/%d |" % (
+            number, t["pedido"] or t["resposta"], t["stan"] or "-", t["hora"][:12], reply,
+            rtt, t["saltos"], EXPECTED_HOPS))
+    lines.append("")
+    kinds: dict[str, int] = {}
+    for t in transactions:
+        label = (f"{t['pedido']}→{t['resposta']}" if t["pedido"] and t["resposta"]
+                 else f"{t['pedido'] or t['resposta']}→sem resposta")
+        kinds[label] = kinds.get(label, 0) + 1
+    mix = ", ".join(f"{n}×{label}" for label, n in sorted(kinds.items()))
+    lines.append(f"- **Respondidas:** {answered} de {total} ({mix})")
+    rtts = [t["rtt_ms"] for t in transactions if t.get("rtt_ms") is not None]
+    if rtts:
+        lines.append(f"- **RTT:** mín {min(rtts):.0f} ms, média "
+                     f"{sum(rtts) / len(rtts):.0f} ms, máx {max(rtts):.0f} ms")
+    complete = sum(1 for t in transactions if t["saltos"] >= EXPECTED_HOPS)
+    lines.append(f"- **Rastreio:** {complete} de {total} com os {EXPECTED_HOPS} saltos "
+                 "(cliente→VS, F5→node, node→F5, VS→cliente)")
+    return "\n".join(lines)
+
+
+def _verdict(kept: list[dict], summary: dict, transactions: list[dict], flows: int) -> str:
+    if not kept:
+        return "Nenhum tráfego da VS na janela capturada."
+    if transactions:
+        answered = sum(1 for t in transactions if t["respondida"])
+        kinds: dict[str, int] = {}
+        for t in transactions:
+            label = t["pedido"] or t["resposta"]
+            kinds[label] = kinds.get(label, 0) + 1
+        mix = ", ".join(f"{n}×{mti}" for mti, n in sorted(kinds.items()))
+        return (f"{len(transactions)} transação(ões) ISO 8583 na VS ({mix}): "
+                f"{answered} respondida(s), {len(transactions) - answered} sem resposta.")
+    text = (f"Tráfego da VS observado ({len(kept)} pacotes em {flows} conexão(ões)), "
+            "sem mensagens ISO 8583 reconhecidas.")
+    if summary["syn"] and not summary["syn_ack"]:
+        text += " Houve SYN sem nenhum SYN-ACK: o destino não respondeu à abertura."
+    return text
+
+
+def simplified_view(
+    packets: list[dict],
+    server_port: int | None = None,
+    node_port: int | None = None,
+    vs_addr: str | None = None,
+    detalhes: bool = False,
+    stan: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Resposta enxuta para o usuário: veredito, contagens e transações — só do tráfego
+    da VS pedida. Com `detalhes`, cada transação traz campos ISO, trajeto e RTT e a
+    visão inclui `tabela_markdown`; `stan` restringe às transações com esse STAN.
+    Devolve (visão, avisos sobre o foco aplicado)."""
+    kept, info = focus_vs_traffic(packets, server_port, node_port, vs_addr)
+    summary = summarize(kept)
+    flows = {_flow_key(p) for p in kept}
+    transactions = build_transactions(kept, detail=detalhes)
+    if stan is not None:
+        transactions = [t for t in transactions if t["stan"] == stan]
+    view = {
+        "resultado": _verdict(kept, summary, transactions, len(flows)),
+        "trafego": {
+            "conexoes": len(flows),
+            "pacotes": len(kept),
+            "syn": summary["syn"],
+            "syn_ack": summary["syn_ack"],
+            "rst": summary["rst"] + summary["rst_ack"],
+            "fin": summary["fin"],
+            "mensagens_iso": sum(summary["mti_counts"].values()),
+        },
+        "transacoes": transactions[:MAX_TRANSACTIONS],
+    }
+    if len(transactions) > MAX_TRANSACTIONS:
+        view["transacoes_omitidas"] = len(transactions) - MAX_TRANSACTIONS
+    if stan is not None and not transactions:
+        view["resultado"] = f"Nenhuma transação com STAN {stan} na janela capturada."
+    if detalhes and transactions:
+        if server_port is not None and vs_addr is not None:
+            label = f"VS {vs_addr}:{server_port}"
+        elif server_port is not None:
+            label = f"VS, porta {server_port}"
+        else:
+            label = "VS"
+        view["tabela_markdown"] = render_details_markdown(view["transacoes"], label)
+
+    notes = []
+    if info["probe_flows"]:
+        notes.append(
+            f"{info['probe_flows']} sonda(s) do monitor do pool "
+            f"({info['probe_packets']} pacotes) foram ignoradas: não são tráfego da VS.")
+    if not info["separated"] and kept:
+        notes.append(
+            "Não foi possível separar o tráfego da VS do restante (informe vs_addr junto "
+            "de server_port, ou use portas de VS e de node diferentes): nada foi "
+            "descartado.")
+    return view, notes
 
 
 if __name__ == "__main__":
