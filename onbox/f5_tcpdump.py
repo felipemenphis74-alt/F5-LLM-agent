@@ -679,6 +679,16 @@ def _run(request, tcpdump_bin, lock_dir, proc_dir, guard_wait_sec):
     packets = parse_pcap(out)
     stderr_text = err.decode("utf-8", "replace")
 
+    # 0 = terminou por -c; 124 = prazo duro (esperado com pouco trafego). Qualquer
+    # outro codigo e falha do proprio tcpdump (interface inexistente, filtro...) e
+    # nao pode virar "ok" com zero pacotes.
+    if status not in (0, 124):
+        raise RequestError(
+            "error",
+            "O tcpdump falhou (exit_status=%s): %s" % (
+                status, stderr_text.strip()[-500:] or "sem stderr"),
+            command=" ".join(argv), exit_status=status)
+
     warnings = []
     for line in stderr_text.splitlines():
         if TMM_WARNING_MARKER in line:

@@ -140,7 +140,8 @@ def _assert_no_blocked_ports(normalized: str, lowered: str) -> None:
     parâmetros de entrada (require_capturable_port) — o filtro BPF em si não é
     alterado."""
     for match in _PORT_TOKEN_RE.finditer(lowered):
-        token = match.group(1).strip("()")
+        # o filtro chega entre aspas e pode ter parenteses colados: "'port 15000)'"
+        token = match.group(1).strip("()'\"")
         if not token.isdigit():
             # só geramos portas decimais; qualquer outra forma (nome de serviço,
             # hex...) não dá para comparar com a lista de bloqueio -> recusa.
