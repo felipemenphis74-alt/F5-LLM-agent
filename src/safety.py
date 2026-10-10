@@ -121,7 +121,7 @@ def assert_safe_tmsh_command(command: str) -> str:
     return normalized
 
 
-# Portas TCP em que esta ferramenta NUNCA executa captura (tcpdump), mesmo que o
+# Portas TCP em que esta ferramenta NUNCA captura trafego, mesmo que o
 # chamador peça explicitamente. Chave = porta; valor = o que ela é (usado na mensagem
 # mostrada ao usuário). Para bloquear outra porta, basta incluí-la aqui.
 BLOCKED_TCPDUMP_PORTS = {
@@ -147,69 +147,3 @@ def require_capturable_port(value, field_name: str) -> int:
     if port in BLOCKED_TCPDUMP_PORTS:
         raise BlockedPortError(blocked_port_message(port))
     return port
-
-
-_PORT_TOKEN_RE = re.compile(r"\bport\s+(\S+)")
-_PORTRANGE_RE = re.compile(r"\bportrange\s+(\d+)\s*-\s*(\d+)")
-
-
-def _assert_no_blocked_ports(normalized: str, lowered: str) -> None:
-    """Defesa em profundidade na validação do comando JÁ MONTADO, independente de
-    quem o montou: nenhuma porta bloqueada pode aparecer no filtro (`port N`,
-    `src/dst port N`, `portrange A-B`). A validação principal acontece antes, nos
-    parâmetros de entrada (require_capturable_port) — o filtro BPF em si não é
-    alterado."""
-    for match in _PORT_TOKEN_RE.finditer(lowered):
-        # o filtro chega entre aspas e pode ter parenteses colados: "'port 15000)'"
-        token = match.group(1).strip("()'\"")
-        if not token.isdigit():
-            # só geramos portas decimais; qualquer outra forma (nome de serviço,
-            # hex...) não dá para comparar com a lista de bloqueio -> recusa.
-            raise CommandNotAllowedError(
-                f"Porta em formato não suportado no filtro tcpdump {token!r}: {normalized!r}"
-            )
-        if int(token) in BLOCKED_TCPDUMP_PORTS:
-            raise BlockedPortError(blocked_port_message(int(token)))
-
-    for match in _PORTRANGE_RE.finditer(lowered):
-        low, high = int(match.group(1)), int(match.group(2))
-        for port in BLOCKED_TCPDUMP_PORTS:
-            if low <= port <= high:
-                raise BlockedPortError(blocked_port_message(port))
-
-
-def assert_safe_tcpdump_command(command: str) -> str:
-    """Valida um comando tcpdump já montado a partir de template fixo."""
-    normalized = command.strip()
-    if not normalized.startswith("tcpdump "):
-        raise CommandNotAllowedError(f"Comando deve começar com 'tcpdump ': {normalized!r}")
-
-    lowered = normalized.lower()
-    # tcpdump é somente captura/leitura por natureza; ainda assim bloqueamos
-    # tentativas de encadear comandos via shell.
-    for token in (";", "&&", "|", "`", "$(", ">", ">>"):
-        if token in lowered:
-            raise CommandNotAllowedError(
-                f"Comando tcpdump contém token proibido {token!r}: {normalized!r}"
-            )
-
-    _assert_no_blocked_ports(normalized, lowered)
-    return normalized
-
-
-# Comando fixo usado só para CONTAR processos tcpdump já em execução no host, como
-# guarda de concorrência antes de iniciar uma nova captura (nunca para checar mais
-# nada além disso, e nunca para matar/alterar processos existentes). Allowlist
-# fechada — sem interpolação de entrada externa, nunca aceita variação.
-ALLOWED_PS_COMMANDS = (
-    "ps -eo pid,comm",
-)
-
-
-def assert_safe_ps_command(command: str) -> str:
-    """Valida o comando fixo de listagem de processos usado para checar quantas
-    capturas tcpdump já estão rodando antes de iniciar uma nova."""
-    normalized = command.strip()
-    if normalized not in ALLOWED_PS_COMMANDS:
-        raise CommandNotAllowedError(f"Comando ps fora do esperado: {normalized!r}")
-    return normalized

@@ -1,101 +1,60 @@
-"""Auto-teste rápido (sem F5 real) dos parsers e das camadas de segurança.
+"""Auto-teste rápido (sem F5 real) dos parsers, da API de captura e das camadas de segurança.
 Roda dentro do container: docker run --rm --entrypoint python f5-mcp-agent:test -m src._selftest
+
+A captura de tráfego é SOMENTE pela API onboard (script no equipamento): aqui ela é
+substituída por um FakeOnbox; o parsing de pcap/ISO 8583 é testado em onbox/test_f5_tcpdump.py.
 """
+import copy
 import json
-import shlex
-import shutil
-import socket
-import struct
-import subprocess
-import time
+import os
 from types import SimpleNamespace
 
-from . import tcpdump_parser, tmsh_parser, safety, comparator
+from . import tmsh_parser, safety, comparator
 from .f5_client import CommandResult, F5Client
 from .safety import UnsafeInputError
 from .inventory import Device, DeviceCredentials
 
-# ---------------------------------------------------------------------------
-# Geração de capturas sintéticas no formato do `tcpdump -nn -X`: pacotes IPv4+TCP
-# bem-formados (cabeçalhos reais), para exercitar a remoção de cabeçalhos e os
-# offsets ISO 8583 do parser de ponta a ponta.
-# ---------------------------------------------------------------------------
 
-TCP_SYN, TCP_SYN_ACK, TCP_PSH_ACK, TCP_RST_ACK = 0x02, 0x12, 0x18, 0x14
+class FakeOnbox:
+    """Substitui o OnboxClient: registra (payload, janela) e devolve (HTTP, corpo)."""
 
+    def __init__(self, status=200, body=None, error=None):
+        self.status, self.body, self.error = status, body if body is not None else {}, error
+        self.calls = []
 
-def _build_ipv4_tcp_packet(src_ip, dst_ip, sport, dport, flags, payload=b""):
-    tcp = struct.pack("!HHIIBBHHH", sport, dport, 1000, 2000, 5 << 4, flags, 65535, 0, 0)
-    total_len = 20 + len(tcp) + len(payload)
-    ip = struct.pack(
-        "!BBHHHBBH4s4s", 0x45, 0, total_len, 0, 0x4000, 64, 6, 0,
-        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
-    )
-    return ip + tcp + payload
+    def capture(self, payload, window_sec):
+        self.calls.append((copy.deepcopy(payload), window_sec))
+        if self.error is not None:
+            raise self.error
+        return self.status, copy.deepcopy(self.body)
 
 
-def _hexdump_x(packet):
-    lines = []
-    for off in range(0, len(packet), 16):
-        chunk = packet[off:off + 16]
-        groups = [chunk[i:i + 2].hex() for i in range(0, len(chunk), 2)]
-        hex_part = " ".join(groups).ljust(39)
-        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-        lines.append(f"\t0x{off:04x}:  {hex_part}  {ascii_part}")
-    return "\n".join(lines)
+# Resposta de sucesso da API de captura (mais campos "internos" que NUNCA podem chegar
+# ao cliente: o servidor MCP entrega só a lista conhecida de campos).
+ONBOX_OK = {
+    "status": "ok",
+    "resultado": "1 transação ISO 8583 respondida na janela observada; os membros do pool "
+                 "respondem ao SYN.",
+    "janela": {"max_s": 60, "encerrou_por": "prazo"},
+    "trafego": {"pacotes": 4, "syn": 1, "syn_ack": 1, "rst": 0, "psh_ack": 2},
+    "transacoes": [{"hora": "14:10:00.001000", "stan": "111111", "pedido": "0800",
+                    "resposta": "0810", "tipo": "Echo Test", "origem": "192.168.0.9",
+                    "respondida": True}],
+    "membros": [{"membro": "192.168.0.9:15000", "situacao": "responde ao SYN",
+                 "syn": 1, "syn_ack": 1, "rst": 0}],
+    "avisos": [],
+    "command": "tcpdump -nn -w -", "stderr": "WARNING tmm", "packets": [{"src": "a"}],
+    "exit_status": 0, "host": "192.0.2.1",
+}
+
+ONBOX_DOWN = dict(ONBOX_OK, resultado="Membro 10.100.2.1:16000 não responde ao SYN "
+                  "(2 SYN, 0 SYN-ACK).", transacoes=[],
+                  trafego={"pacotes": 0, "syn": 0, "syn_ack": 0, "rst": 0, "psh_ack": 0},
+                  membros=[{"membro": "10.100.2.1:16000",
+                            "situacao": "não responde ao SYN (sem SYN-ACK)",
+                            "syn": 2, "syn_ack": 0, "rst": 0}])
 
 
-def _entry(time, src, sport, dst, dport, flag_txt, flags, payload=b""):
-    pkt = _build_ipv4_tcp_packet(src, dst, sport, dport, flags, payload)
-    header = (
-        f"{time} IP {src}.{sport} > {dst}.{dport}: "
-        f"Flags [{flag_txt}], seq 1000, win 502, length {len(payload)}"
-    )
-    return header + "\n" + _hexdump_x(pkt) + "\n"
-
-
-def _iso_payload(mti, bit70, bit11="000123"):
-    """Mensagem ISO 8583 sintética: 7 bytes de prefixo (tamanho + header) -> MTI
-    (4 ASCII) -> bitmap (32 chars ASCII-hex) -> campos de tamanho fixo. Total 94
-    bytes = 188 chars hex, batendo com os offsets do parser (MTI em 14, bit7 em 86...)."""
-    prefix = b"\x00\x5a" + b"ISO01"
-    bitmap = b"8220000000000000" + b"0400000000000000"
-    fields = (
-        b"0920140102"          # bit 7
-        + bit11.encode()       # bit 11 (STAN)
-        + b"123456"            # bit 32
-        + b"000000000123"      # bit 37 (RRN/NSU)
-        + bit70.encode()       # bit 70 (NMIC)
-        + b"12345"             # bit 100
-        + b"123456789"         # bit 127
-    )
-    return prefix + mti.encode() + bitmap + fields
-
-
-SAMPLE_TCPDUMP = (
-    _entry("14:01:02.100000", "10.1.1.5", 51000, "10.1.1.10", 443, "S", TCP_SYN)
-    + _entry("14:01:02.100500", "10.1.1.10", 443, "10.1.1.5", 51000, "S.", TCP_SYN_ACK)
-    + _entry("14:01:02.101000", "10.1.1.5", 51000, "10.1.1.10", 443, "P.", TCP_PSH_ACK,
-             _iso_payload("0800", "301"))
-    + _entry("14:01:02.150000", "10.1.1.10", 443, "10.1.1.5", 51000, "P.", TCP_PSH_ACK,
-             _iso_payload("0810", "301"))
-    + _entry("14:01:02.170000", "10.1.1.5", 51000, "10.1.1.10", 443, "P.", TCP_PSH_ACK,
-             _iso_payload("0800", "001", bit11="000124"))
-    + _entry("14:01:02.200000", "10.1.1.10", 443, "10.1.1.5", 51000, "R.", TCP_RST_ACK)
-)
-
-# Payload TCP que NÃO é ISO 8583 (banner SSH) — não pode gerar MTI/bits/marcadores.
-SAMPLE_NON_ISO = _entry(
-    "14:02:00.000000", "10.1.1.5", 40000, "10.1.1.10", 22, "P.", TCP_PSH_ACK,
-    b"SSH-2.0-OpenSSH_7.4\r\n",
-)
-
-# Payload curto demais para ter MTI estruturado, mas com o token "0800" — cai na
-# heurística legada (marcador request_0800), só olhando o payload TCP.
-SAMPLE_LEGACY = _entry(
-    "14:03:00.000000", "10.1.1.5", 40001, "10.1.1.10", 9000, "P.", TCP_PSH_ACK,
-    b"xx0800yy",
-)
 
 SAMPLE_LIST_VS = """\
 ltm virtual vs_web_443 {
@@ -393,15 +352,13 @@ def _security_checks(device, real_client):
         def show_sys_connections(self, *args, **kwargs):
             return CommandResult("c", SAMPLE_SYS_CONNECTIONS + SAMPLE_NOISE, "", 0)
 
-        def tcpdump_capture(self, **kwargs):
-            return CommandResult("c", SAMPLE_TCPDUMP, "WARNING - The recommended number of "
-                                 "tmm tcpdump instances (2) has been exceeded", 124)
 
     server._get_inventory = lambda: SimpleNamespace(
-        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=60,
+        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=180,
                                ssh_connect_timeout_sec=5, command_timeout_sec=5),
         list_devices=lambda: [device])
     server._client_for = lambda name: SweepClient()
+    server._onbox_for = lambda name: FakeOnbox(body=ONBOX_OK)
     outputs = {
         "list_devices": server.list_devices(),
         "get_virtual_server_status": server.get_virtual_server_status("d", "vs_full_443"),
@@ -417,8 +374,8 @@ def _security_checks(device, real_client):
     assert outputs["get_pool_status"]["pool"] == "/Common/pool_web_443", outputs["get_pool_status"]
     for label, value in outputs.items():
         _assert_clean(label, value)
-    # os avisos genéricos substituem o texto do TMOS
-    assert server.MSG_CONCURRENT in outputs["tcpdump_validate_traffic"]["avisos"]
+    # o que a API devolve a mais (comando, stderr, pacotes, host) nunca chega ao cliente
+    assert set(outputs["tcpdump_validate_traffic"]) <= {"status", *server.CAPTURE_RESPONSE_KEYS}
     # sem filtro, a tabela de conexões não é entregue
     for call in (lambda: server.get_pool_status("d", ""),
                  lambda: server.get_virtual_server_status("d", "   "),
@@ -557,12 +514,14 @@ def _security_checks(device, real_client):
         "tcpdump_validate_traffic", "tcpdump_capture_connection"}, [t.name for t in tools]
     banned = ("ssh", "tmsh", "perl", "paramiko", "bash", "advanced shell", "known_hosts",
               "inventory", "senha", "password", "credencia", "sudo", "docker", "/app/",
-              "stderr", "pcap", "alarm", "processo", "autentic")
+              "stderr", "pcap", "alarm", "processo", "autentic", "onbox", "icontrol",
+              "restjavad", "restnoded", "f5_tcpdump", "/mgmt")
     for tool in tools:
         text = (tool.description or "") + json.dumps(tool.inputSchema, ensure_ascii=False)
         for term in banned:
             assert term not in text.lower(), f"{tool.name}: descrição cita {term!r}"
         assert not re.search(FORBIDDEN_WORDS_RE, text, re.I), tool.name
+        assert not re.search(r"\b(api|rest|rest api)\b", text, re.I), (tool.name, "cita API")
         props = set(tool.inputSchema.get("properties", {}))
         assert not props & {"interface", "verbose", "command", "raw"}, (tool.name, props)
     instructions = server.mcp.instructions or ""
@@ -586,7 +545,7 @@ def _security_checks(device, real_client):
         # as regras que reforçam a política precisam estar no texto do agente
         for rule in ("Somente leitura", "Confidencialidade", "Nunca invente",
                      "Sem sugestões de configuração", "AD, RADIUS, NTP", "tabela_markdown",
-                     "busy", "não tente de novo", "Nunca enumere VS", "vs_name",
+                     "busy", "não tente de novo", "Nunca enumere VS", "vs_name", "60 s", "180 s",
                      "adicionar, remover, substituir"):
             assert rule.lower() in text.lower(), f"agente sem a regra: {rule!r}"
         # toda ferramenta citada na tabela de uso existe de fato
@@ -600,54 +559,6 @@ def _security_checks(device, real_client):
           % len(tools))
 
 def run():
-    print("== tcpdump parser (flags + ISO 8583) ==")
-    packets = tcpdump_parser.parse_tcpdump_output(SAMPLE_TCPDUMP)
-    assert len(packets) == 6, f"esperado 6 pacotes, veio {len(packets)}"
-    labels = [p["flags_label"] for p in packets]
-    assert labels == ["SYN", "SYN-ACK", "PSH-ACK", "PSH-ACK", "PSH-ACK", "RST-ACK"], labels
-
-    # pacotes sem payload não têm MTI
-    assert packets[0]["mti"] is None and packets[5]["mti"] is None
-
-    echo_req, echo_resp, signon = packets[2], packets[3], packets[4]
-    assert echo_req["mti"] == "0800" and echo_resp["mti"] == "0810", (echo_req, echo_resp)
-    assert echo_req["bit7"] == "0920140102", echo_req
-    assert echo_req["bit11"] == "000123", echo_req
-    assert echo_req["bit32"] == "123456", echo_req
-    assert echo_req["bit37"] == "000000000123", echo_req
-    assert echo_req["bit70"] == "301" and echo_req["bit70_desc"] == "Echo Test", echo_req
-    assert echo_req["bit100"] == "12345" and echo_req["bit127"] == "123456789", echo_req
-    assert echo_req["is_echo_test"] and not echo_req["is_signon"], echo_req
-    assert "MTI:0800" in echo_req["markers_found"], echo_req["markers_found"]
-    assert "NMIC:301" in echo_req["markers_found"], echo_req["markers_found"]
-    assert echo_resp["is_echo_test"], echo_resp
-    assert signon["bit70"] == "001" and signon["is_signon"], signon
-    assert signon["bit70_desc"] == "Sign-On" and signon["bit11"] == "000124", signon
-
-    summary = tcpdump_parser.summarize(packets)
-    assert summary["syn"] == 1 and summary["syn_ack"] == 1 and summary["rst_ack"] == 1
-    assert summary["psh_ack"] == 3, summary
-    assert summary["mti_counts"] == {"0800": 2, "0810": 1}, summary
-    assert summary["network_codes"] == {"301": 2, "001": 1}, summary
-    assert summary["echo_tests"] == 2 and summary["signon"] == 1 and summary["signoff"] == 0
-    assert summary["request_0800_count"] == 2 and summary["response_0810_count"] == 1
-    print("OK:", summary)
-
-    print("== tcpdump parser (payload nao-ISO nao gera falso positivo) ==")
-    non_iso = tcpdump_parser.parse_tcpdump_output(SAMPLE_NON_ISO)
-    assert len(non_iso) == 1, non_iso
-    assert non_iso[0]["mti"] is None and non_iso[0]["bit70"] is None, non_iso[0]
-    assert non_iso[0]["markers_found"] == [], non_iso[0]
-    print("OK: banner SSH sem MTI/bits/marcadores")
-
-    print("== tcpdump parser (fallback legado 0800 no payload) ==")
-    legacy = tcpdump_parser.parse_tcpdump_output(SAMPLE_LEGACY)
-    assert len(legacy) == 1 and legacy[0]["mti"] is None, legacy
-    assert any("request_0800" in m for m in legacy[0]["markers_found"]), legacy[0]
-    legacy_summary = tcpdump_parser.summarize(legacy)
-    assert legacy_summary["request_0800_count"] == 1, legacy_summary
-    print("OK:", legacy[0]["markers_found"])
-
     print("== tmsh parser (virtual servers) ==")
     vs_list = tmsh_parser.parse_virtual_servers(SAMPLE_LIST_VS)
     assert len(vs_list) == 2, vs_list
@@ -692,28 +603,18 @@ def run():
     assert safety.assert_safe_tmsh_command("tmsh show ltm virtual vs_web_443").startswith("tmsh show")
     print("OK: comando read-only permitido")
 
-    print("== safety: porta TCP 1222 (captura RISe) proibida no tcpdump ==")
-    base = "tcpdump -nn -X -i any -c 10"
-    blocked_cases = {
-        "porta 1222 explicita": f"{base} port 1222",
-        "1222 dentro de OR": f"{base} (port 15000 or port 1222)",
-        "src/dst port 1222": f"{base} dst port 1222",
-        "portrange que inclui 1222": f"{base} portrange 1000-2000",
-        "1222 com zeros a esquerda": f"{base} port 01222",
-        "1222 junto de host": f"{base} port 1222 and host 10.100.2.1",
-    }
-    for label, cmd in blocked_cases.items():
+    print("== safety: o MCP não executa tcpdump (nem processos) por SSH ==")
+    for gone in ("assert_safe_tcpdump_command", "assert_safe_ps_command"):
+        assert not hasattr(safety, gone), gone
+    for cmd in ("tcpdump -nn -i any -c 10", "ps -eo args", "perl -e 'alarm 5'", "cat /etc/passwd"):
         try:
-            safety.assert_safe_tcpdump_command(cmd)
-            raise AssertionError(f"deveria ter bloqueado: {label}: {cmd}")
-        except safety.BlockedPortError as exc:
-            assert "1222" in str(exc) and "RISe" in str(exc), (label, str(exc))
-            assert "desabilitadas para esta ferramenta" in str(exc), (label, str(exc))
-    print(f"OK: {len(blocked_cases)} variações bloqueadas com mensagem RISe")
+            safety.assert_safe_tmsh_command(cmd)
+            raise AssertionError(f"deveria recusar: {cmd}")
+        except safety.CommandNotAllowedError:
+            pass
+    print("OK: só a allowlist tmsh de leitura existe; tcpdump/ps recusados")
 
-    ok_cmd = f"{base} port 15000 and host 10.100.2.1"
-    assert safety.assert_safe_tcpdump_command(ok_cmd) == ok_cmd
-    assert safety.assert_safe_tcpdump_command(base) == base  # sem filtro: não é alterado
+    print("== safety: porta TCP 1222 (captura RISe) proibida ==")
     assert safety.require_capturable_port(15000, "node_port") == 15000
     for bad in (1222, "1222", " 1222 ", 1222.0):  # qualquer forma de entrada da porta
         try:
@@ -726,177 +627,209 @@ def run():
             ), str(exc)
     print("OK: porta comum passa; 1222 bloqueada em qualquer forma; mensagem exata ao usuário")
 
-    print("== f5_client: tcpdump_capture respeita a proibição (sem rede) ==")
     device = Device(
         name="f5-selftest", host="192.0.2.1", port=22, partition="Common", tags=[],
         credentials=DeviceCredentials(user="u", password="p", key_path=None),
     )
     client = F5Client(device=device, connect_timeout_sec=1, command_timeout_sec=1)
-    ssh_calls = []
+    assert not any(n.startswith("tcpdump") or n in ("count_running_tcpdump",)
+                   for n in dir(client)), "o cliente SSH não captura tráfego"
 
-    def fake_run(cmd):
-        ssh_calls.append(cmd)
-        return CommandResult(command=cmd, stdout="", stderr="", exit_status=0)
+    print("== cliente da API de captura: login -> POST -> job_id (202) -> resultado ==")
+    from . import onbox_client as oc
+    from .f5_client import F5ConnectionError
 
-    client._run = fake_run
-    client.count_running_tcpdump = lambda: 0
-    capture_kwargs = dict(interface="any", count=5, max_count=500, timeout_sec=5, max_timeout_sec=60)
+    scripted = iter([
+        (200, {"token": {"token": "TKN"}}),                  # login
+        (202, {"job_id": "j1", "status": "running"}),         # POST: captura em andamento
+        (202, {"job_id": "j1", "status": "running"}),         # GET 1: ainda rodando
+        (200, {"status": "ok", "resultado": "pronto"}),       # GET 2: fim
+    ])
+    sent = []
 
-    for kwargs in ({"server_port": 1222, "node_port": None}, {"server_port": None, "node_port": 1222}):
-        try:
-            client.tcpdump_capture(**capture_kwargs, **kwargs)
-            raise AssertionError(f"deveria ter bloqueado {kwargs}")
-        except safety.BlockedPortError:
-            pass
-    assert ssh_calls == [], "porta proibida não pode gerar NENHUM comando no F5"
+    def scripted_http(method, path, body=None, token=None, timeout=None):
+        sent.append((method, path, token, body))
+        return next(scripted)
 
-    client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=15000, host="10.100.2.1")
-    assert ssh_calls[-1].endswith("'port 15000 and host 10.100.2.1'"), ssh_calls[-1]
-    assert "1222" not in ssh_calls[-1], "o filtro BPF não deve ser alterado pela proibição"
-
-    client.tcpdump_capture(**capture_kwargs, server_port=None, node_port=None)  # sem filtro nenhum
-    assert ssh_calls[-1].endswith("-c 5"), ssh_calls[-1]
-    print("OK: 1222 recusada na validação, sem tocar no F5; filtro normal intacto:", ssh_calls[-2])
-
-    print("== f5_client: filtro com DUAS portas chega ao shell remoto entre aspas ==")
-    # Regressão de um bug real (visto no F5): sem aspas, "(port A or port B)" é erro de
-    # sintaxe do shell -> tcpdump nem roda (exit 1, 0 pacotes).
-    client.tcpdump_capture(**capture_kwargs, server_port=15000, node_port=16000)
-    two_ports = ssh_calls[-1]
-    assert two_ports.endswith("'(port 15000 or port 16000)'"), two_ports
-    assert shlex.split(two_ports)[-1] == "(port 15000 or port 16000)", shlex.split(two_ports)
-    shell = shutil.which("sh")
-    if shell:
-        buggy = "timeout 5 tcpdump -nn -c 5 (port 15000 or port 16000)"
-        assert subprocess.run([shell, "-n", "-c", buggy], capture_output=True).returncode != 0, \
-            "o comando sem aspas deveria ser erro de sintaxe do shell"
-        fixed = subprocess.run([shell, "-n", "-c", two_ports], capture_output=True)
-        assert fixed.returncode == 0, fixed.stderr
-        print("OK: sh -n aceita o comando entre aspas; recusa a forma antiga")
-    else:
-        print("OK (sh indisponível: só a forma do argumento foi conferida)")
-
-    print("== f5_client: com IP e porta confirmados, filtro por conexão (IP E porta) ==")
-    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=15000,
-                           vs_addr="10.100.1.10", client_addr="192.168.170.1",
-                           node_addr="192.168.0.9")
-    specific = shlex.split(ssh_calls[-1])[-1]
-    assert specific == ("((port 17000 and host 10.100.1.10 and host 192.168.170.1) or "
-                        "(port 15000 and host 192.168.0.9))"), specific
-    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,
-                           vs_addr="10.100.1.10")
-    assert shlex.split(ssh_calls[-1])[-1] == "port 17000 and host 10.100.1.10", ssh_calls[-1]
-    for bad in ("10.100.1.10 or port 22", "10.100.1.0/24", "zezinho", "10.100.1.10'"):
-        try:
-            client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None, vs_addr=bad)
-            raise AssertionError(f"deveria ter recusado vs_addr {bad!r}")
-        except UnsafeInputError:
-            pass
-    print("OK: cada perna vira 'porta AND IPs'; IP inválido recusado:", specific)
-
-    print("== f5_client: uma solicitação = UM processo tcpdump no F5 (sem `timeout`) ==")
-    argv = shlex.split(ssh_calls[-1])
-    assert argv[:4] == ["perl", "-e", "alarm(shift), exec(@ARGV)", "5"], argv
-    assert argv[4] == "tcpdump" and "-l" in argv and "timeout" not in argv, argv
-
-    def killed_by_alarm(cmd):
-        return CommandResult(command=cmd, stdout="", stderr="", exit_status=-1)
-
-    client._run = killed_by_alarm
-    real_monotonic = time.monotonic
-    ticks = iter([100.0, 105.2])  # início / fim: prazo de 5 s vencido
-    time.monotonic = lambda: next(ticks)
+    api = oc.OnboxClient(device, host="192.0.2.9", port=443)
+    api._http = scripted_http
+    real_poll = oc.POLL_INTERVAL_SEC
+    oc.POLL_INTERVAL_SEC = 0.0
     try:
-        assert client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None
-                                      ).exit_status == 124
-        ticks = iter([100.0, 101.0])  # morto por sinal ANTES do prazo: não é o alarme
-        assert client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None
-                                      ).exit_status == -1
-    finally:
-        time.monotonic = real_monotonic
-        client._run = fake_run
-    print("OK: perl alarm + exec do tcpdump; fim pelo prazo -> 124, antes do prazo -> -1")
+        status, body = api.capture({"server_port": 17000, "timeout_sec": 60}, 60)
+        assert (status, body["status"]) == (200, "ok"), (status, body)
+        assert [(m, p, t) for m, p, t, _ in sent] == [
+            ("POST", oc.LOGIN_PATH, None),
+            ("POST", oc.CAPTURE_PATH, "TKN"),
+            ("GET", oc.CAPTURE_PATH + "?job_id=j1", "TKN"),
+            ("GET", oc.CAPTURE_PATH + "?job_id=j1", "TKN")], sent
+        assert sent[0][3] == {"username": "u", "password": "p", "loginProviderName": "tmos"}
+        assert sent[1][3] == {"server_port": 17000, "timeout_sec": 60}, sent[1]
 
-    print("== server: falha do próprio tcpdump nunca vira status ok ==")
+        # respostas rápidas (invalid/blocked/busy) voltam direto, sem consulta de job
+        for code, answer in ((400, "invalid"), (403, "blocked"), (429, "busy")):
+            scripted = iter([(200, {"token": {"token": "T"}}), (code, {"status": answer})])
+            sent.clear()
+            assert api.capture({"count": 0}, 60) == (code, {"status": answer})
+            assert len(sent) == 2, sent
+
+        # prazo vencido (janela + folga) com a captura ainda em andamento -> 504 genérico
+        scripted = iter([(200, {"token": {"token": "T"}}), (202, {"job_id": "j9"})])
+        assert api.capture({}, -oc.EXTRA_WAIT_SEC - 1) == (504, {"status": "error"})
+
+        # login recusado / sem senha -> falha de conexão (o servidor troca por msg genérica)
+        scripted = iter([(401, {})])
+        try:
+            api.capture({}, 60)
+            raise AssertionError("login recusado deveria falhar")
+        except F5ConnectionError:
+            pass
+        no_pwd = Device(name="n", host="192.0.2.1", port=22, partition="Common", tags=[],
+                        credentials=DeviceCredentials(user="u", password=None, key_path="k"))
+        try:
+            oc.OnboxClient(no_pwd, host="192.0.2.9").capture({}, 60)
+            raise AssertionError("sem senha deveria falhar")
+        except F5ConnectionError:
+            pass
+    finally:
+        oc.POLL_INTERVAL_SEC = real_poll
+
+    # transporte real sem rede: conexão recusada vira F5ConnectionError (sem vazar nada)
+    try:
+        oc.OnboxClient(device, host="127.0.0.1", port=1, connect_timeout_sec=2)._http("GET", "/x")
+        raise AssertionError("deveria falhar")
+    except F5ConnectionError:
+        pass
+    # destino: o próprio dispositivo por padrão; variável de ambiente só para o lab
+    saved = {k: os.environ.pop(k, None) for k in ("F5_MCP_REST_HOST", "F5_MCP_REST_PORT",
+                                                  "F5_MCP_REST_VERIFY_TLS", "F5_MCP_REST_CA_BUNDLE")}
+    try:
+        default = oc.OnboxClient(device)
+        assert (default.host, default.port, default.verify_tls) == ("192.0.2.1", 443, False)
+        os.environ["F5_MCP_REST_HOST"] = "198.51.100.7"
+        os.environ["F5_MCP_REST_PORT"] = "8443"
+        os.environ["F5_MCP_REST_VERIFY_TLS"] = "true"
+        tuned = oc.OnboxClient(device)
+        assert (tuned.host, tuned.port, tuned.verify_tls) == ("198.51.100.7", 8443, True)
+        import ssl
+        assert tuned._context().verify_mode == ssl.CERT_REQUIRED
+        assert default._context().verify_mode == ssl.CERT_NONE
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+    print("OK: sequência login/POST/GET ?job_id=; 400/403/429 diretos; prazo -> 504; login/sem "
+          "senha/rede -> F5ConnectionError; destino e TLS por ambiente")
+
+    print("== server: captura SOMENTE pela API; padrão 60 s, extensível até 180 s ==")
     from . import server
 
-    class FakeClient:
-        def __init__(self, exit_status, stderr=""):
-            self.exit_status, self.stderr = exit_status, stderr
-
-        def tcpdump_capture(self, **kwargs):
-            return CommandResult(command="tcpdump ...", stdout="", stderr=self.stderr,
-                                 exit_status=self.exit_status)
-
     server._get_inventory = lambda: SimpleNamespace(
-        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=60))
-    server._client_for = lambda device: FakeClient(1, "bash: syntax error near unexpected token `('")
-    failed = server.tcpdump_validate_traffic("f5-selftest", node_port=15000)
-    assert failed["status"] == "error" and failed["message"] == server.MSG_CAPTURE_FAILED, failed
-    # o detalhe técnico (stderr/comando/código) NÃO chega ao cliente
-    assert set(failed) == {"status", "message"}, failed
-    assert "syntax error" not in json.dumps(failed), failed
-    for good in (0, 124):  # 124 = prazo duro, esperado com pouco tráfego
-        server._client_for = lambda device, code=good: FakeClient(code)
-        assert server.tcpdump_validate_traffic("f5-selftest", node_port=15000)["status"] == "ok"
-    print("OK: exit 1 -> status error genérico (sem stderr/comando); 0 e 124 -> ok")
+        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=180,
+                               ssh_connect_timeout_sec=5, command_timeout_sec=5),
+        list_devices=lambda: [device], get=lambda name: device)
+    assert type(server._onbox_for("f5-selftest")).__name__ == "OnboxClient"
+
+    def no_tmsh(name):
+        raise AssertionError("captura por porta não deve abrir sessão de comando no dispositivo")
+
+    server._client_for = no_tmsh
+    fake = FakeOnbox(body=ONBOX_OK)
+    server._onbox_for = lambda name: fake
+    scope = dict(server_port=17000, vs_addr="10.100.1.10", node_port=15000, node_addr="192.168.0.9")
+
+    out = server.tcpdump_validate_traffic("f5-selftest", **scope)
+    payload, window = fake.calls[-1]
+    assert window == 60 and payload == {
+        "server_port": 17000, "node_port": 15000, "vs_addr": "10.100.1.10",
+        "node_addr": "192.168.0.9", "count": 100, "timeout_sec": 60, "detalhes": False}, payload
+    assert out["status"] == "ok" and out["avisos"] == [], out
+    assert set(out) <= {"status", *server.CAPTURE_RESPONSE_KEYS}, set(out)
+    for noisy in ("command", "stderr", "packets", "exit_status", "host"):
+        assert noisy not in out, noisy
+    _assert_clean("captura", out)
+    import inspect
+    assert inspect.signature(server.tcpdump_validate_traffic).parameters["timeout_sec"].default == 60
+    assert inspect.signature(server.tcpdump_capture_connection).parameters["timeout_sec"].default == 60
+
+    server.tcpdump_validate_traffic("f5-selftest", **scope, timeout_sec=180)
+    assert fake.calls[-1][0]["timeout_sec"] == 180 and fake.calls[-1][1] == 180
+    server.tcpdump_validate_traffic("f5-selftest", **scope, timeout_sec=1, count=500)
+    assert fake.calls[-1][0]["count"] == 500 and fake.calls[-1][1] == 1
+    before = len(fake.calls)
+    for kwargs in ({"timeout_sec": 0}, {"timeout_sec": 181}, {"timeout_sec": -5},
+                   {"count": 0}, {"count": 501}):
+        try:
+            server.tcpdump_validate_traffic("f5-selftest", **scope, **kwargs)
+            raise AssertionError(f"deveria recusar {kwargs}")
+        except UnsafeInputError as exc:
+            assert "entre 1 e" in str(exc), str(exc)
+    assert len(fake.calls) == before, "limites inválidos não podem chegar ao equipamento"
+    print("OK: padrão 60 s (janela e payload), 180 s aceito, 0/181/count 501 recusados antes da API")
+
+    print("== server: porta 1222 e IP inválido são recusados ANTES de qualquer chamada ==")
+    before = len(fake.calls)
+    for kwargs in ({"server_port": 1222}, {"node_port": 1222},
+                   {"server_port": 17000, "node_port": 1222}):
+        refused = server.tcpdump_validate_traffic("f5-selftest", **kwargs)
+        assert refused == {"status": "blocked", "message": safety.blocked_port_message(1222)}, refused
+        assert "RISe" in refused["message"]
+    for field in ("host", "client_addr", "vs_addr", "node_addr"):
+        for bad in ("10.100.1.10 or port 22", "10.100.1.0/24", "zezinho", "10.100.1.10'"):
+            try:
+                server.tcpdump_validate_traffic("f5-selftest", server_port=17000, **{field: bad})
+                raise AssertionError(f"deveria ter recusado {field}={bad!r}")
+            except UnsafeInputError:
+                pass
+    assert len(fake.calls) == before, "recusas locais não podem gerar chamada à API"
+    print("OK: 1222 -> blocked com a mensagem RISe; IP inválido recusado nos 4 campos")
+
+    print("== server: status da API viram respostas estruturadas e genéricas ==")
+    cases = (
+        (FakeOnbox(429, {"status": "busy", "message": "tmm tcpdump instances (2) exceeded"}),
+         "busy"),
+        (FakeOnbox(200, {"status": "busy"}), "busy"),
+        (FakeOnbox(403, {"status": "blocked", "message": "x"}), "blocked"),
+        (FakeOnbox(400, {"status": "invalid", "message": "node_port inválido"}), "invalid"),
+        (FakeOnbox(500, {"status": "error", "message": "Traceback: /shared/f5_tcpdump.py"}),
+         "error"),
+        (FakeOnbox(504, {"status": "error"}), "error"),
+        (FakeOnbox(200, "texto qualquer"), "error"),
+    )
+    for onbox, expected in cases:
+        server._onbox_for = lambda name, o=onbox: o
+        got = server.tcpdump_validate_traffic("f5-selftest", **scope)
+        assert got["status"] == expected, (expected, got)
+        _assert_clean("status " + expected, got)
+        assert "Traceback" not in json.dumps(got) and "tmm" not in json.dumps(got), got
+        if expected == "busy":
+            assert got["message"] == server.MSG_BUSY and got["retry_after_minutes"] == 5, got
+        if expected == "error":
+            assert got == {"status": "error", "message": server.MSG_CAPTURE_FAILED}, got
+        if expected == "blocked":
+            assert got["message"] == safety.blocked_port_message(1222), got
+    for failure in (F5ConnectionError("REST indisponível em 192.0.2.1: [Errno 111] password=p"),
+                    OSError("[Errno 113] No route to host 192.0.2.1")):
+        server._onbox_for = lambda name, f=failure: FakeOnbox(error=f)
+        try:
+            server.tcpdump_validate_traffic("f5-selftest", **scope)
+            raise AssertionError("deveria falhar")
+        except RuntimeError as raised:
+            assert str(raised) == server.MSG_UNAVAILABLE, str(raised)
+    print("OK: busy/blocked/invalid/error estruturados; falha de transporte -> mensagem genérica")
 
     print("== server: captura só por porta avisa que é abrangente ==")
-    server._client_for = lambda device: FakeClient(0)
+    fake = FakeOnbox(body=ONBOX_OK)
+    server._onbox_for = lambda name: fake
     broad = server.tcpdump_validate_traffic("f5-selftest", server_port=17000, node_port=15000)
     assert any("Captura abrangente" in w for w in broad["avisos"]), broad["avisos"]
-    narrow = server.tcpdump_validate_traffic(
-        "f5-selftest", server_port=17000, vs_addr="10.100.1.10",
-        node_port=15000, node_addr="192.168.0.9")
+    narrow = server.tcpdump_validate_traffic("f5-selftest", **scope)
     assert narrow["avisos"] == [], narrow["avisos"]
     print("OK: porta sem IP -> aviso; IP+porta nos dois lados -> sem aviso")
 
-    print("== server: resposta simples só do tráfego da VS (sem sondas do monitor) ==")
-    probe_text = (
-        _entry("14:10:00.000100", "192.168.0.9", 50000, "10.100.1.10", 17000, "S", TCP_SYN)
-        + _entry("14:10:00.000200", "10.100.1.10", 17000, "192.168.0.9", 50000, "S.", TCP_SYN_ACK)
-        + _entry("14:10:00.001000", "192.168.0.9", 50000, "10.100.1.10", 17000, "P.",
-                 TCP_PSH_ACK, _iso_payload("0800", "301", bit11="111111"))
-        + _entry("14:10:00.001500", "10.100.1.10", 17000, "192.168.0.9", 50000, "P.",
-                 TCP_PSH_ACK, _iso_payload("0810", "301", bit11="111111"))
-        + _entry("14:10:01.000000", "10.100.1.20", 4321, "192.168.0.9", 15000, "S", TCP_SYN)
-        + _entry("14:10:01.000100", "192.168.0.9", 15000, "10.100.1.20", 4321, "S.", TCP_SYN_ACK)
-        + _entry("14:10:01.000200", "10.100.1.20", 4321, "192.168.0.9", 15000, "R", 0x04)
-    )
-
-    class TextClient:
-        def tcpdump_capture(self, **kwargs):
-            return CommandResult(command="tcpdump ...", stdout=probe_text, stderr="",
-                                 exit_status=124)
-
-    server._client_for = lambda device: TextClient()
-    scope = dict(server_port=17000, vs_addr="10.100.1.10", node_port=15000,
-                 node_addr="192.168.0.9")
-    simple = server.tcpdump_validate_traffic("f5-selftest", **scope)
-    assert simple["status"] == "ok", simple
-    for noisy in ("command", "packets", "stderr", "summary", "exit_status"):
-        assert noisy not in simple, noisy
-    assert simple["transacoes"] == [{
-        "hora": "14:10:00.001000", "stan": "111111", "pedido": "0800", "resposta": "0810",
-        "tipo": "Echo Test", "origem": "192.168.0.9", "respondida": True}], simple["transacoes"]
-    assert simple["trafego"]["pacotes"] == 4 and simple["trafego"]["syn_ack"] == 1, simple["trafego"]
-    assert simple["janela"] == {"max_s": 20, "encerrou_por": "prazo"}, simple["janela"]
-    assert simple["avisos"] == [], simple["avisos"]   # sondas do monitor: fora e sem citar
-    print("OK: 4 pacotes da VS + 1 transação por STAN; sonda ignorada (avisada)")
-
     print("== server: membro do pool sem SYN+ACK é informado (análise por membro) ==")
-    down_text = (
-        _entry("14:20:00.000000", "10.100.1.20", 4001, "10.100.2.1", 16000, "S", TCP_SYN)
-        + _entry("14:20:00.500000", "10.100.1.20", 4001, "10.100.2.1", 16000, "R.", TCP_RST_ACK)
-        + _entry("14:20:05.000000", "10.100.1.20", 4002, "10.100.2.1", 16000, "S", TCP_SYN)
-        + _entry("14:20:05.500000", "10.100.1.20", 4002, "10.100.2.1", 16000, "R.", TCP_RST_ACK)
-    )
-
-    class DownClient:
-        def tcpdump_capture(self, **kwargs):
-            return CommandResult(command="x", stdout=down_text, stderr="", exit_status=124)
-
-    server._client_for = lambda device: DownClient()
+    server._onbox_for = lambda name: FakeOnbox(body=ONBOX_DOWN)
     down = server.tcpdump_validate_traffic(
         "f5-selftest", server_port=16000, vs_addr="10.100.1.10", node_port=16000,
         node_addr="10.100.2.1")
@@ -906,31 +839,22 @@ def run():
                                 "syn": 2, "syn_ack": 0, "rst": 0}], down["membros"]
     assert "10.100.2.1:16000 não responde ao SYN" in down["resultado"], down["resultado"]
     assert down["trafego"]["pacotes"] == 0 and down["avisos"] == [], down
-    assert "sonda" not in json.dumps(down) and "monitor" not in json.dumps(down)
-    print("OK: \"Membro 10.100.2.1:16000 não responde ao SYN (2 SYN, 0 SYN-ACK)\" sem listar sondas")
-    server._client_for = lambda device: TextClient()   # volta ao cenario com transacoes
+    print("OK: \"Membro 10.100.2.1:16000 não responde ao SYN (2 SYN, 0 SYN-ACK)\" repassado")
 
-    print("== server: detalhes=True devolve a tabela no padrão pedido ==")
-    detailed_view = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True)
-    assert detailed_view["status"] == "ok", detailed_view
-    lines = detailed_view["tabela_markdown"].splitlines()
-    assert lines[0] == "**Transações (VS 10.100.1.10:17000)** — 1 respondida(s) de 1", lines[0]
-    assert lines[2] == "| # | Tipo | STAN | Enviada | Resposta | RTT | Rastreio |", lines[2]
-    assert lines[4].startswith("| 1 | 0800 | 111111 | 14:10:00.001 | 0810 / 111111 | ") and \
-        lines[4].endswith(" ms | 2/4 |"), lines[4]
-    tx = detailed_view["transacoes"][0]
-    assert tx["campos"]["bit11"] == "111111" and tx["campos"]["bit70"] == "301", tx
-    assert [h["mti"] for h in tx["trajeto"]] == ["0800", "0810"] and tx["saltos"] == 2, tx
-    assert tx["rtt_ms"] == 0 or tx["rtt_ms"] == 1, tx   # 14:10:00.001000 -> .001500
-    for leak in ("payload", "packets", "command", "stderr"):
-        assert leak not in json.dumps(detailed_view), leak
-    only = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True, stan="111111")
-    assert [t["stan"] for t in only["transacoes"]] == ["111111"], only
-    nothing = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True, stan="000000")
-    assert nothing["transacoes"] == [] and "tabela_markdown" not in nothing, nothing
-    assert "tabela_markdown" not in simple and "campos" not in simple["transacoes"][0]
-    print("OK: tabela '# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio' + campos/trajeto/RTT; "
-          "filtro por STAN; resposta simples inalterada")
+    print("== server: detalhes=True/stan seguem para a API e a tabela é repassada ==")
+    table = ("**Transações (VS 10.100.1.10:17000)** — 1 respondida(s) de 1\n\n"
+             "| # | Tipo | STAN | Enviada | Resposta | RTT | Rastreio |\n"
+             "|---|---|---|---|---|---|---|\n"
+             "| 1 | 0800 | 111111 | 14:10:00.001 | 0810 / 111111 | 1 ms | 2/4 |")
+    fake = FakeOnbox(body=dict(ONBOX_OK, tabela_markdown=table))
+    server._onbox_for = lambda name: fake
+    detailed = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True, stan="111111")
+    payload = fake.calls[-1][0]
+    assert payload["detalhes"] is True and payload["stan"] == "111111", payload
+    assert detailed["tabela_markdown"] == table, detailed
+    simple = server.tcpdump_validate_traffic("f5-selftest", **scope)
+    assert fake.calls[-1][0]["detalhes"] is False and "stan" not in fake.calls[-1][0]
+    print("OK: payload com detalhes/stan; tabela_markdown entregue como veio")
 
     print("== tmsh parser: descrição, destino numérico e members do `list` ==")
     vs_all = tmsh_parser.parse_virtual_servers(SAMPLE_VS_LIST)
@@ -959,8 +883,8 @@ def run():
     print("== server: tcpdump_capture_connection foca só a conexão pedida ==")
 
     class ConnClient:
-        def __init__(self):
-            self.captures = []
+        def __init__(self, pool_show=SAMPLE_POOL_SHOW):
+            self.pool_show = pool_show
 
         def list_virtual_server_config(self, vs_name=None):
             return CommandResult(command="", stdout=SAMPLE_VS_LIST, stderr="", exit_status=0)
@@ -972,82 +896,60 @@ def run():
             return CommandResult(command="", stdout=SAMPLE_POOL_LIST, stderr="", exit_status=0)
 
         def show_pool(self, pool_name=None):
-            return CommandResult(command="", stdout=SAMPLE_POOL_SHOW, stderr="", exit_status=0)
+            return CommandResult(command="", stdout=self.pool_show, stderr="", exit_status=0)
 
-        def tcpdump_capture(self, **kwargs):
-            self.captures.append(kwargs)
-            return CommandResult(command="tcpdump ...", stdout="", stderr="", exit_status=124)
-
-    conn_client = ConnClient()
-    server._client_for = lambda device: conn_client
-    for broad, status in (("app", "ambiguous"), ("padaria do joaozinho", "not_found")):
-        out = server.tcpdump_capture_connection("f5-selftest", broad)
+    fake = FakeOnbox(body=ONBOX_OK)
+    server._onbox_for = lambda name: fake
+    server._client_for = lambda name: ConnClient()
+    for broad_name, status in (("app", "ambiguous"), ("padaria do joaozinho", "not_found")):
+        out = server.tcpdump_capture_connection("f5-selftest", broad_name)
         assert out["status"] == status, out
-        assert conn_client.captures == [], "pedido abrangente/inexistente NÃO pode capturar"
+        assert fake.calls == [], "pedido abrangente/inexistente NÃO pode capturar"
+        for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
+            assert other not in json.dumps(out), other
+        assert "available_connections" not in out and "candidates" not in out, out
 
     out = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho",
                                             client_addr="192.168.170.1")
     assert out["status"] == "ok", out
-    sent = conn_client.captures[-1]
-    assert (sent["server_port"], sent["vs_addr"], sent["client_addr"]) == \
-        (17000, "10.100.1.10", "192.168.170.1"), sent
-    assert sent["node_members"] == [("192.168.0.9", 15000)], sent  # IP do node "web01" via `list`
-    assert sent["node_port"] is None and sent["node_addr"] is None and sent["host"] is None, sent
+    payload, window = fake.calls[-1]
+    assert window == 60 and payload == {
+        "server_port": 17000, "vs_addr": "10.100.1.10", "client_addr": "192.168.170.1",
+        "members": [{"addr": "192.168.0.9", "port": 15000}],  # IP do node "web01" via `list`
+        "count": 100, "timeout_sec": 60, "detalhes": False}, payload
     assert out["conexao"]["membros"] == ["192.168.0.9:15000"], out["conexao"]
     assert out["conexao"]["vs_ip_porta"] == "10.100.1.10:17000", out["conexao"]
-    # nada sobre outras VS/pools (nem que o member e compartilhado)
-    assert not any("compartilhado" in w or "app1" in w for w in out["avisos"]), out["avisos"]
+    assert out["conexao"]["vs"] == "vs_app3_17000", out["conexao"]
     for noisy in ("command", "packets", "stderr", "summary", "connection", "warnings"):
         assert noisy not in out, noisy
-    # o filtro que o F5Client real monta para esses parâmetros
-    client._run = fake_run
-    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,
-                           vs_addr="10.100.1.10", node_members=[("192.168.0.9", 15000)])
-    assert shlex.split(ssh_calls[-1])[-1] == (
-        "((port 17000 and host 10.100.1.10) or (port 15000 and host 192.168.0.9))"), ssh_calls[-1]
-    # not_found: nao lista as demais VS; ambiguous: so as que casam com o pedido
-    nf = server.tcpdump_capture_connection("f5-selftest", "padaria do joaozinho")
-    assert nf["status"] == "not_found" and "available_connections" not in nf, nf
-    for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
-        assert other not in json.dumps(nf), other
-    amb = server.tcpdump_capture_connection("f5-selftest", "app")
-    assert amb["status"] == "ambiguous" and "candidates" not in amb, amb   # so a contagem
-    for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
-        assert other not in json.dumps(amb), other
-    print("OK: 'app' -> ambiguous, sem captura; padaria -> só VS 10.100.1.10:17000 + member "
-          "192.168.0.9:15000, sem nenhuma menção a outras VS")
+    assert not any("compartilhado" in w or "app1" in w for w in out["avisos"]), out["avisos"]
 
-    print("== server: captura de uma VS não traz transações de outra VS (mesmo node/STAN) ==")
-    other_vs_text = (
-        _entry("14:10:00.001000", "192.168.0.9", 50000, "10.100.1.10", 17000, "P.", TCP_PSH_ACK,
-               _iso_payload("0800", "301", bit11="000001"))
-        + _entry("14:10:00.001500", "10.100.1.20", 50000, "192.168.0.9", 15000, "P.", TCP_PSH_ACK,
-                 _iso_payload("0800", "301", bit11="000001"))
-        + _entry("14:10:00.030000", "192.168.0.9", 15000, "10.100.1.20", 50000, "P.", TCP_PSH_ACK,
-                 _iso_payload("0810", "301", bit11="000001"))
-        + _entry("14:10:00.030500", "10.100.1.10", 17000, "192.168.0.9", 50000, "P.", TCP_PSH_ACK,
-                 _iso_payload("0810", "301", bit11="000001"))
-        # outra VS (:15000) no MESMO node, MESMO STAN, 30 s depois, outra porta efemera
-        + _entry("14:10:30.000000", "10.100.1.20", 49991, "192.168.0.9", 15000, "P.", TCP_PSH_ACK,
-                 _iso_payload("0800", "301", bit11="000001"))
-        + _entry("14:10:30.030000", "192.168.0.9", 15000, "10.100.1.20", 49991, "P.", TCP_PSH_ACK,
-                 _iso_payload("0810", "301", bit11="000001"))
-        # sonda do monitor
-        + _entry("14:10:31.000000", "10.100.1.20", 4321, "192.168.0.9", 15000, "S", TCP_SYN)
-    )
+    server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho", timeout_sec=180,
+                                      detalhes=True, stan="111111")
+    payload, window = fake.calls[-1]
+    assert window == 180 and payload["timeout_sec"] == 180, (payload, window)
+    assert payload["detalhes"] is True and payload["stan"] == "111111", payload
+    assert "client_addr" not in payload and "node_port" not in payload, payload
 
-    class OtherVsClient(ConnClient):
-        def tcpdump_capture(self, **kwargs):
-            return CommandResult(command="x", stdout=other_vs_text, stderr="", exit_status=124)
-
-    server._client_for = lambda device: OtherVsClient()
-    mine = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho", detalhes=True)
-    assert mine["status"] == "ok", mine
-    assert len(mine["transacoes"]) == 1 and mine["transacoes"][0]["saltos"] == 4, mine["transacoes"]
-    assert mine["trafego"]["pacotes"] == 4 and mine["avisos"] == [], mine
-    for citing in ("49991", "4321", "app1", "outra VS", "sonda"):
-        assert citing not in json.dumps(mine, ensure_ascii=False), citing
-    print("OK: 1 transação / 4 saltos; perna da outra VS (mesmo STAN, 30 s depois) e sonda fora")
+    before = len(fake.calls)
+    for kwargs in ({"timeout_sec": 181}, {"timeout_sec": 0}, {"count": 501}):
+        try:
+            server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho", **kwargs)
+            raise AssertionError(f"deveria recusar {kwargs}")
+        except UnsafeInputError:
+            pass
+    # membro do pool na porta 1222: recusado sem chamar a API
+    server._client_for = lambda name: ConnClient(SAMPLE_POOL_SHOW.replace("web01:15000", "web01:1222"))
+    refused = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho")
+    assert refused["status"] == "blocked" and "1222" in refused["message"], refused
+    assert len(fake.calls) == before, "limites/1222 não podem chegar ao equipamento"
+    # a API ocupada/recusando chega estruturada também por aqui, com a conexão identificada
+    server._client_for = lambda name: ConnClient()
+    server._onbox_for = lambda name: FakeOnbox(429, {"status": "busy"})
+    busy = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho")
+    assert busy["status"] == "busy" and busy["conexao"]["vs"] == "vs_app3_17000", busy
+    print("OK: 'app' -> ambiguous e inexistente -> not_found sem captura; padaria -> só a VS "
+          "10.100.1.10:17000 + membro 192.168.0.9:15000; 60 s padrão, 180 s aceito")
 
     _security_checks(device, client)
 
