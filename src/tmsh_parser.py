@@ -256,22 +256,27 @@ def _normalize(text: str) -> str:
 
 
 def match_virtual_servers(virtual_servers: list[dict], connection: str) -> list[dict]:
-    """VS que correspondem ao nome de conexão pedido pelo usuário.
-
-    Um nome de VS idêntico ao pedido ganha sozinho. Senão, a VS corresponde se TODAS
-    as palavras do pedido aparecem no nome, na descrição ou no pool dela (sem
-    diferenciar maiúsculas/acentos/separadores) — "padaria do zezinho" acha a VS de
-    descrição "parceiro - Padaria do zezinho". Pedido vazio não corresponde a nada."""
+    """VS que correspondem ao nome pedido pelo usuário (sem diferenciar maiúsculas,
+    acentos nem separadores). Em ordem de precisão, a primeira regra que achar algo vence:
+      1. nome idêntico ao da VS;
+      2. o pedido, sem espaços, está no nome/pool/descrição sem espaços — "app 2" acha
+         `vs_app2_16000` e NÃO `vs_app1_15000` (ao contrário de casar palavra solta);
+      3. TODAS as palavras do pedido aparecem no nome, descrição ou pool — "padaria do
+         zezinho" acha a VS de descrição "parceiro - Padaria do zezinho".
+    Pedido vazio não corresponde a nada."""
     wanted = _normalize(connection)
     if not wanted:
         return []
     exact = [vs for vs in virtual_servers if _normalize(vs["vs_name"]) == wanted]
     if exact:
         return exact
+
+    def haystack(vs: dict) -> str:
+        return " ".join(_normalize(vs.get(k) or "") for k in ("vs_name", "description", "pool_name"))
+
+    squeezed = wanted.replace(" ", "")
+    compact = [vs for vs in virtual_servers if squeezed in haystack(vs).replace(" ", "")]
+    if compact:
+        return compact
     tokens = wanted.split()
-    matches = []
-    for vs in virtual_servers:
-        haystack = " ".join(_normalize(vs.get(k) or "") for k in ("vs_name", "description", "pool_name"))
-        if all(token in haystack for token in tokens):
-            matches.append(vs)
-    return matches
+    return [vs for vs in virtual_servers if all(token in haystack(vs) for token in tokens)]
