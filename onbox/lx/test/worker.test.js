@@ -33,9 +33,14 @@ function scriptedChild(spec) {
         child.signals.push(signal);
         setImmediate(function () { child.emit("close", null, signal); });
     };
+    // captura "longa": so termina quando o teste chama child.finishWith(objeto)
+    child.finishWith = function (obj, code) {
+        child.stdout.emit("data", Buffer.from(JSON.stringify(obj) + "\n"));
+        child.emit("close", code === undefined ? 0 : code, null);
+    };
     child.stdin.end = function (data) {
         child.written = data;
-        if (spec.hang) {
+        if (spec.hang || spec.manual) {
             return;
         }
         setImmediate(function () {
@@ -79,7 +84,9 @@ function newWorker() {
     return {worker: worker, Worker: Worker};
 }
 
-function invoke(worker, method, body) {
+var BASE_URI = "/shared/f5_tcpdump";
+
+function invoke(worker, method, body, query) {
     // completeRestOperation resolve a promessa DA OPERACAO recebida - varios pedidos
     // podem estar em andamento no mesmo worker ao mesmo tempo.
     worker.completeRestOperation = function (operation) {
@@ -91,6 +98,7 @@ function invoke(worker, method, body) {
             body: undefined,
             contentType: null,
             resolve: resolve,
+            getUri: function () { return {pathname: BASE_URI, query: query === undefined ? {} : query}; },
             getBody: function () { return body; },
             setBody: function (b) { op.body = b; },
             setStatusCode: function (s) { op.statusCode = s; },
@@ -226,6 +234,7 @@ test("prazo duro: SIGTERM, depois SIGKILL, resposta 504", function () {
     var made = newWorker();
     made.Worker.CONFIG.deadlineMarginSec = 0.05;
     made.Worker.CONFIG.killGraceMs = 20;
+    made.Worker.CONFIG.fastWindowMs = 5000;     // POST sincrono: espera o prazo estourar
     var child = scriptedChild({hang: true});
     // um filho que ignora o SIGTERM: so fecha no SIGKILL
     child.kill = function (signal) {
@@ -250,6 +259,7 @@ test("limite de processos simultaneos -> 429 sem iniciar outro", function () {
     made.Worker.CONFIG.maxInFlight = 2;
     made.Worker.CONFIG.deadlineMarginSec = 0.05;
     made.Worker.CONFIG.killGraceMs = 10;
+    made.Worker.CONFIG.fastWindowMs = 5000;
     nextChildren.push(scriptedChild({hang: true}), scriptedChild({hang: true}));
     var a = invoke(made.worker, "Post", {timeout_sec: 1});
     var b = invoke(made.worker, "Post", {timeout_sec: 1});
@@ -268,6 +278,202 @@ test("limite de processos simultaneos -> 429 sem iniciar outro", function () {
     });
 });
 
+// ---- modo assincrono (capturas que passam do ~60 s do restjavad) -----------------------
+
+function asyncWorker(overrides) {
+    var made = newWorker();
+    made.Worker.CONFIG.fastWindowMs = 15;
+    Object.keys(overrides || {}).forEach(function (key) {
+        made.Worker.CONFIG[key] = overrides[key];
+    });
+    return made.worker;
+}
+
+function startLong(w, request) {
+    var child = scriptedChild({manual: true});
+    nextChildren.push(child);
+    return invoke(w, "Post", request || {timeout_sec: 180}).then(function (op) {
+        return {op: op, child: child};
+    });
+}
+
+function poll(w, id) {
+    return invoke(w, "Get", null, {job_id: id});
+}
+
+function nextTick() {
+    return new Promise(function (resolve) { setTimeout(resolve, 5); });
+}
+
+test("captura longa: POST devolve 202 + job_id e GET acompanha ate o resultado", function () {
+    var w = asyncWorker();
+    var started;
+    var id;
+    return startLong(w).then(function (s) {
+        started = s;
+        assert.strictEqual(s.op.statusCode, 202);
+        assert.strictEqual(s.op.body.status, "running");
+        assert.ok(/^[0-9a-f]{32}$/.test(s.op.body.job_id), s.op.body.job_id);
+        id = s.op.body.job_id;
+        assert.strictEqual(s.op.body.poll, "/mgmt/shared/f5_tcpdump?job_id=" + id);
+        assert.strictEqual(w.inFlight, 1);
+        return poll(w, id);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 202);
+        assert.strictEqual(op.body.status, "running");
+        assert.strictEqual(op.body.job_id, id);
+        var reply = {status: "ok", exit_status: 124, summary: {total_packets: 7}, packets: []};
+        started.child.finishWith(reply);
+        return nextTick().then(function () {
+            return poll(w, id);
+        }).then(function (done) {
+            assert.strictEqual(done.statusCode, 200);
+            assert.strictEqual(done.body.status, "ok");
+            assert.strictEqual(done.body.job_id, id);
+            assert.deepStrictEqual(done.body.summary, reply.summary);
+            assert.ok(done.body.started_at && done.body.finished_at);
+            assert.strictEqual(w.inFlight, 0);
+            // o resultado continua consultavel (nao e "consumido" pela leitura)
+            return poll(w, id);
+        });
+    }).then(function (again) {
+        assert.strictEqual(again.statusCode, 200);
+        assert.strictEqual(again.body.job_id, id);
+    });
+});
+
+test("job_id tambem e aceito com query em string e em lista", function () {
+    var w = asyncWorker();
+    var id;
+    return startLong(w).then(function (s) {
+        id = s.op.body.job_id;
+        return invoke(w, "Get", null, "job_id=" + id);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 202);
+        return invoke(w, "Get", null, {job_id: [id, "outro"]});
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 202);
+        assert.strictEqual(op.body.job_id, id);
+    });
+});
+
+test("o mapeamento de status do resultado assincrono e o mesmo do POST", function () {
+    var cases = [["error", 500], ["busy", 429], ["blocked", 403], ["invalid", 400]];
+    var chain = Promise.resolve();
+    cases.forEach(function (pair) {
+        chain = chain.then(function () {
+            var w = asyncWorker();
+            return startLong(w).then(function (s) {
+                s.child.finishWith({status: pair[0], message: "m"});
+                return nextTick().then(function () {
+                    return poll(w, s.op.body.job_id);
+                });
+            }).then(function (op) {
+                assert.strictEqual(op.statusCode, pair[1], pair[0]);
+                assert.strictEqual(op.body.status, pair[0]);
+            });
+        });
+    });
+    return chain;
+});
+
+test("resposta rapida (busy/invalid) continua sincrona e nao deixa job guardado", function () {
+    var w = asyncWorker({fastWindowMs: 5000});
+    nextChildren.push(scriptedChild({stdout: JSON.stringify({status: "busy", message: "m"})}));
+    return invoke(w, "Post", {timeout_sec: 5}).then(function (op) {
+        assert.strictEqual(op.statusCode, 429);
+        assert.strictEqual(op.body.job_id, undefined);
+        return invoke(w, "Get");
+    }).then(function (info) {
+        assert.strictEqual(info.statusCode, 200);
+        assert.strictEqual(info.body.jobs.stored, 0);
+        assert.strictEqual(info.body.async.max_timeout_sec, 180);
+    });
+});
+
+test("id desconhecido -> 404, id malformado ou vazio -> 400, nada e executado", function () {
+    var w = asyncWorker();
+    return poll(w, new Array(33).join("a")).then(function (op) {
+        assert.strictEqual(op.statusCode, 404);
+        assert.strictEqual(op.body.status, "not_found");
+        return poll(w, "../etc/passwd");
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 400);
+        return poll(w, "");
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 400);
+        return poll(w, new Array(33).join("A"));      // so hexa minusculo
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 400);
+        assert.strictEqual(spawnCalls.length, 0);
+    });
+});
+
+test("resultado expira depois do TTL", function () {
+    var w = asyncWorker({jobTtlSec: 0.02});
+    var id;
+    return startLong(w).then(function (s) {
+        id = s.op.body.job_id;
+        s.child.finishWith({status: "ok"});
+        return nextTick();
+    }).then(function () {
+        return poll(w, id);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 200);
+        return new Promise(function (resolve) { setTimeout(resolve, 40); });
+    }).then(function () {
+        return poll(w, id);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 404);
+    });
+});
+
+test("maxJobs: guarda so os concluidos mais recentes", function () {
+    var w = asyncWorker({maxJobs: 2, maxInFlight: 10});
+    var ids = [];
+    var chain = Promise.resolve();
+    [0, 1, 2, 3].forEach(function (n) {
+        chain = chain.then(function () {
+            return startLong(w).then(function (s) {
+                ids.push(s.op.body.job_id);
+                return new Promise(function (resolve) { setTimeout(resolve, 3); }).then(function () {
+                    s.child.finishWith({status: "ok", n: n});
+                });
+            });
+        });
+    });
+    return chain.then(function () {
+        return invoke(w, "Get");     // dispara a limpeza
+    }).then(function (info) {
+        assert.strictEqual(info.body.jobs.stored, 2);
+        return poll(w, ids[0]);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 404);
+        return poll(w, ids[3]);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 200);
+        assert.strictEqual(op.body.n, 3);
+    });
+});
+
+test("prazo duro de job assincrono: 504 consultavel e vaga liberada", function () {
+    var w = asyncWorker({deadlineMarginSec: 0.05, killGraceMs: 10});
+    var child = scriptedChild({manual: true});
+    nextChildren.push(child);
+    var id;
+    return invoke(w, "Post", {timeout_sec: 1}).then(function (op) {
+        assert.strictEqual(op.statusCode, 202);
+        id = op.body.job_id;
+        return new Promise(function (resolve) { setTimeout(resolve, 1200); });
+    }).then(function () {
+        return poll(w, id);
+    }).then(function (op) {
+        assert.strictEqual(op.statusCode, 504);
+        assert.strictEqual(op.body.status, "error");
+        assert.strictEqual(child.signals[0], "SIGTERM");
+        assert.strictEqual(w.inFlight, 0);
+    });
+});
 // ---- execucao ---------------------------------------------------------------------
 
 var failures = 0;

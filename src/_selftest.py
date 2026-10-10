@@ -6,10 +6,12 @@ import shutil
 import socket
 import struct
 import subprocess
+import time
 from types import SimpleNamespace
 
 from . import tcpdump_parser, tmsh_parser, safety, comparator
 from .f5_client import CommandResult, F5Client
+from .safety import UnsafeInputError
 from .inventory import Device, DeviceCredentials
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,74 @@ Status
 """
 
 
+# Saídas reais do F5 de teste (encurtadas). Node do pool da VS 3 renomeado para
+# "web01" (sem IP no nome) para exercitar a busca do IP real no `list`.
+SAMPLE_VS_LIST = """ltm virtual vs_app1_15000 {
+    destination 10.100.1.10:hydap
+    ip-protocol tcp
+    pool pool_app1_15000
+}
+ltm virtual vs_app2_16000 {
+    destination 10.100.1.10:fmsas
+    pool pool_app2_16000
+}
+ltm virtual vs_app3_17000 {
+    description "parceiro - Padaria do zezinho"
+    destination 10.100.1.10:17000
+    pool pool_app3_17000
+}
+"""
+
+SAMPLE_VS_SHOW = """
+Ltm::Virtual Server: vs_app3_17000
+Status
+  Availability     : available
+  Destination      : 10.100.1.10:17000
+"""
+
+SAMPLE_POOL_LIST = """ltm pool pool_app1_15000 {
+    members {
+        node_app_10.100.2.1:hydap {
+            address 10.100.2.1
+            session monitor-enabled
+            state down
+        }
+        web01:hydap {
+            address 192.168.0.9
+            session monitor-enabled
+            state up
+        }
+    }
+    monitor tcp_half_open
+}
+ltm pool pool_app2_16000 {
+    members {
+        node_app_10.100.2.1:fmsas {
+            address 10.100.2.1
+        }
+    }
+    monitor tcp_half_open
+}
+ltm pool pool_app3_17000 {
+    members {
+        web01:hydap {
+            address 192.168.0.9
+            session monitor-enabled
+            state up
+        }
+    }
+    monitor tcp_half_open
+}
+"""
+
+SAMPLE_POOL_SHOW = """
+Ltm::Pool: pool_app3_17000
+  | Ltm::Pool Member: web01:15000
+  |   Availability   : available
+  |   State          : enabled
+"""
+
+
 def run():
     print("== tcpdump parser (flags + ISO 8583) ==")
     packets = tcpdump_parser.parse_tcpdump_output(SAMPLE_TCPDUMP)
@@ -179,7 +249,7 @@ def run():
     print("== tmsh parser (virtual servers) ==")
     vs_list = tmsh_parser.parse_virtual_servers(SAMPLE_LIST_VS)
     assert len(vs_list) == 2, vs_list
-    assert vs_list[0] == {"vs_name": "vs_web_443", "address": "10.1.1.10", "port": 443, "pool_name": "pool_web_443"}
+    assert vs_list[0] == {"vs_name": "vs_web_443", "address": "10.1.1.10", "port": 443, "pool_name": "pool_web_443", "description": None}
     print("OK:", vs_list)
 
     print("== tmsh parser (pool members) ==")
@@ -300,6 +370,47 @@ def run():
     else:
         print("OK (sh indisponível: só a forma do argumento foi conferida)")
 
+    print("== f5_client: com IP e porta confirmados, filtro por conexão (IP E porta) ==")
+    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=15000,
+                           vs_addr="10.100.1.10", client_addr="192.168.170.1",
+                           node_addr="192.168.0.9")
+    specific = shlex.split(ssh_calls[-1])[-1]
+    assert specific == ("((port 17000 and host 10.100.1.10 and host 192.168.170.1) or "
+                        "(port 15000 and host 192.168.0.9))"), specific
+    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,
+                           vs_addr="10.100.1.10")
+    assert shlex.split(ssh_calls[-1])[-1] == "port 17000 and host 10.100.1.10", ssh_calls[-1]
+    for bad in ("10.100.1.10 or port 22", "10.100.1.0/24", "zezinho", "10.100.1.10'"):
+        try:
+            client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None, vs_addr=bad)
+            raise AssertionError(f"deveria ter recusado vs_addr {bad!r}")
+        except UnsafeInputError:
+            pass
+    print("OK: cada perna vira 'porta AND IPs'; IP inválido recusado:", specific)
+
+    print("== f5_client: uma solicitação = UM processo tcpdump no F5 (sem `timeout`) ==")
+    argv = shlex.split(ssh_calls[-1])
+    assert argv[:4] == ["perl", "-e", "alarm(shift), exec(@ARGV)", "5"], argv
+    assert argv[4] == "tcpdump" and "-l" in argv and "timeout" not in argv, argv
+
+    def killed_by_alarm(cmd):
+        return CommandResult(command=cmd, stdout="", stderr="", exit_status=-1)
+
+    client._run = killed_by_alarm
+    real_monotonic = time.monotonic
+    ticks = iter([100.0, 105.2])  # início / fim: prazo de 5 s vencido
+    time.monotonic = lambda: next(ticks)
+    try:
+        assert client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None
+                                      ).exit_status == 124
+        ticks = iter([100.0, 101.0])  # morto por sinal ANTES do prazo: não é o alarme
+        assert client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None
+                                      ).exit_status == -1
+    finally:
+        time.monotonic = real_monotonic
+        client._run = fake_run
+    print("OK: perl alarm + exec do tcpdump; fim pelo prazo -> 124, antes do prazo -> -1")
+
     print("== server: falha do próprio tcpdump nunca vira status ok ==")
     from . import server
 
@@ -321,6 +432,86 @@ def run():
         server._client_for = lambda device, code=good: FakeClient(code)
         assert server.tcpdump_validate_traffic("f5-selftest", node_port=15000)["status"] == "ok"
     print("OK: exit 1 -> status error com stderr; 0 e 124 -> ok")
+
+    print("== server: captura só por porta avisa que é abrangente ==")
+    server._client_for = lambda device: FakeClient(0)
+    broad = server.tcpdump_validate_traffic("f5-selftest", server_port=17000, node_port=15000)
+    assert any("Captura abrangente" in w for w in broad["warnings"]), broad["warnings"]
+    narrow = server.tcpdump_validate_traffic(
+        "f5-selftest", server_port=17000, vs_addr="10.100.1.10",
+        node_port=15000, node_addr="192.168.0.9")
+    assert narrow["warnings"] == [], narrow["warnings"]
+    print("OK: porta sem IP -> warning; IP+porta nos dois lados -> sem warning")
+
+    print("== tmsh parser: descrição, destino numérico e members do `list` ==")
+    vs_all = tmsh_parser.parse_virtual_servers(SAMPLE_VS_LIST)
+    assert [v["description"] for v in vs_all] == [None, None, "parceiro - Padaria do zezinho"], vs_all
+    assert vs_all[0]["port"] is None  # `list` traz "hydap": porta numérica só pelo `show`
+    assert tmsh_parser.parse_vs_destination(SAMPLE_VS_SHOW) == ("10.100.1.10", 17000)
+    assert tmsh_parser.parse_vs_destination("nada") == (None, None)
+    pool_lists = tmsh_parser.parse_pool_list_members(SAMPLE_POOL_LIST)
+    assert pool_lists["pool_app3_17000"] == [
+        {"node": "web01", "address": "192.168.0.9", "service": "hydap"}], pool_lists
+    assert len(pool_lists["pool_app1_15000"]) == 2, pool_lists
+    print("OK:", pool_lists["pool_app3_17000"])
+
+    print("== tmsh parser: conexão pedida pelo usuário -> VS ==")
+    match = tmsh_parser.match_virtual_servers
+    assert [v["vs_name"] for v in match(vs_all, "Padaria do Zézinho")] == ["vs_app3_17000"]
+    assert [v["vs_name"] for v in match(vs_all, "vs_app1_15000")] == ["vs_app1_15000"]
+    assert len(match(vs_all, "app")) == 3  # abrangente: casa com várias
+    assert match(vs_all, "padaria do joaozinho") == [] and match(vs_all, "  ") == []
+    print("OK: nome/descrição sem acento e caixa; 'app' -> 3 candidatas; inexistente -> 0")
+
+    print("== server: tcpdump_capture_connection foca só a conexão pedida ==")
+
+    class ConnClient:
+        def __init__(self):
+            self.captures = []
+
+        def list_virtual_server_config(self, vs_name=None):
+            return CommandResult(command="", stdout=SAMPLE_VS_LIST, stderr="", exit_status=0)
+
+        def show_virtual_servers(self, vs_name=None):
+            return CommandResult(command="", stdout=SAMPLE_VS_SHOW, stderr="", exit_status=0)
+
+        def list_pool_config(self, pool_name=None):
+            return CommandResult(command="", stdout=SAMPLE_POOL_LIST, stderr="", exit_status=0)
+
+        def show_pool(self, pool_name=None):
+            return CommandResult(command="", stdout=SAMPLE_POOL_SHOW, stderr="", exit_status=0)
+
+        def tcpdump_capture(self, **kwargs):
+            self.captures.append(kwargs)
+            return CommandResult(command="tcpdump ...", stdout="", stderr="", exit_status=124)
+
+    conn_client = ConnClient()
+    server._client_for = lambda device: conn_client
+    for broad, status in (("app", "ambiguous"), ("padaria do joaozinho", "not_found")):
+        out = server.tcpdump_capture_connection("f5-selftest", broad)
+        assert out["status"] == status, out
+        assert conn_client.captures == [], "pedido abrangente/inexistente NÃO pode capturar"
+    assert {c["vs_name"] for c in server.tcpdump_capture_connection(
+        "f5-selftest", "app")["candidates"]} == {"vs_app1_15000", "vs_app2_16000", "vs_app3_17000"}
+
+    out = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho",
+                                            client_addr="192.168.170.1")
+    assert out["status"] == "ok", out
+    sent = conn_client.captures[-1]
+    assert (sent["server_port"], sent["vs_addr"], sent["client_addr"]) == \
+        (17000, "10.100.1.10", "192.168.170.1"), sent
+    assert sent["node_members"] == [("192.168.0.9", 15000)], sent  # IP do node "web01" via `list`
+    assert sent["node_port"] is None and sent["node_addr"] is None and sent["host"] is None, sent
+    assert out["connection"]["pool_members"] == ["192.168.0.9:15000"], out["connection"]
+    assert any("vs_app1_15000" in w and "compartilhado" in w for w in out["warnings"]), out
+    # o filtro que o F5Client real monta para esses parâmetros
+    client._run = fake_run
+    client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,
+                           vs_addr="10.100.1.10", node_members=[("192.168.0.9", 15000)])
+    assert shlex.split(ssh_calls[-1])[-1] == (
+        "((port 17000 and host 10.100.1.10) or (port 15000 and host 192.168.0.9))"), ssh_calls[-1]
+    print("OK: 'app' -> ambiguous, sem captura; padaria -> só VS 10.100.1.10:17000 + member "
+          "192.168.0.9:15000; aviso de member compartilhado com vs_app1_15000")
 
     print("\nTODOS OS AUTO-TESTES PASSARAM")
 

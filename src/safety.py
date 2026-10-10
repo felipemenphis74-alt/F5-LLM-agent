@@ -14,6 +14,7 @@ Isso garante que mesmo que um valor malicioso tente "escapar" (ex: nome de VS co
 `; tmsh delete ltm virtual all`), a validação de identificador já rejeita antes de
 chegar perto de montar o comando.
 """
+import ipaddress
 import re
 
 # Identificadores (nomes de VS, pool, partição, device, interface...) só podem conter
@@ -43,6 +44,16 @@ def require_identifier(value: str, field_name: str) -> str:
             f"Valor inválido para '{field_name}': {value!r}. "
             "Apenas letras, números, '_', '-', '.', '/' são permitidos."
         )
+    return value
+
+
+def require_ip(value: str, field_name: str) -> str:
+    """Endereço IPv4/IPv6 literal (sem máscara nem nome) — usado nos filtros de
+    captura por IP, onde um nome ou texto livre não faz sentido."""
+    try:
+        ipaddress.ip_address(value)
+    except (TypeError, ValueError):
+        raise UnsafeInputError(f"Endereço IP inválido para '{field_name}': {value!r}")
     return value
 
 

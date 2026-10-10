@@ -30,7 +30,12 @@ mcp = FastMCP(
         "Agente somente-leitura para monitoramento de F5 BIG-IP: status de "
         "Virtual Servers/Pools, sys connections, comparação com baseline de "
         "propósito (Excel/Sheets) e validação de padrões de tráfego via tcpdump. "
-        "Nunca realiza alterações de configuração."
+        "Nunca realiza alterações de configuração. "
+        "Capturas tcpdump devem ser focadas na conexão que o usuário pediu: se ele "
+        "citar uma conexão pelo nome, use tcpdump_capture_connection (resolve VS e pool "
+        "members e captura só aquele IP:porta). Se o pedido for abrangente (casa com "
+        "várias conexões ou não cita nenhuma), não faça uma captura ampla — quebre em "
+        "conexões específicas e valide uma por vez, ou pergunte ao usuário qual."
     ),
 )
 
@@ -207,11 +212,25 @@ def tcpdump_validate_traffic(
     host: Optional[str] = None,
     count: int = 100,
     timeout_sec: int = 20,
+    client_addr: Optional[str] = None,
+    vs_addr: Optional[str] = None,
+    node_addr: Optional[str] = None,
 ) -> dict:
     """Executa uma captura tcpdump somente-leitura no BIG-IP (via SSH, sem gravar
-    .pcap) filtrando por porta de servidor (VS), porta de node/pool member e,
-    opcionalmente, por `host` (IP do pool member/node — afunila a captura a um device
-    específico em vez de qualquer tráfego na(s) porta(s), útil ao validar um pool). A
+    .pcap) filtrando por porta de servidor (VS), porta de node/pool member e pelos
+    IPs de cada lado da conexão.
+
+    SEJA ESPECÍFICO: quando o IP e a porta da conexão a validar já estiverem
+    confirmados (ex: lidos da config da VS/pool), passe-os — `vs_addr` (+
+    `client_addr`, se conhecido) junto de `server_port`, e `node_addr` junto de
+    `node_port`. Cada lado vira um filtro "IP E porta" (ex: `(port 17000 and host
+    10.100.1.10 and host 192.168.170.1) or (port 15000 and host 192.168.0.9)`), e a
+    captura pega só aquela conexão — não o monitor de outros pools nem outra VS na
+    mesma porta. Captura só por porta, sem IP, é abrangente e o retorno avisa isso em
+    'warnings'. `host` (legado) faz AND com o filtro inteiro.
+
+    A captura roda como UM único processo tcpdump no F5 (o prazo duro é um alarme no
+    próprio processo, sem wrapper `timeout` ao lado). A
     análise identifica SYN, SYN+ACK, RST/RST+ACK, ACK, origem de cada pacote, e procura
     os marcadores de payload '0800' (request) / '0810' (resposta) — ajuste se o
     protocolo do cliente usar outra convenção. A captura é limitada por --count e por
@@ -236,14 +255,39 @@ def tcpdump_validate_traffic(
 
     Requer que a conta SSH tenha 'Advanced shell (bash)' habilitado no BIG-IP (tcpdump
     não roda dentro do prompt tmsh)."""
+    return _run_capture(
+        _client_for(device), interface=interface, count=count, timeout_sec=timeout_sec,
+        server_port=server_port, node_port=node_port, host=host,
+        client_addr=client_addr, vs_addr=vs_addr, node_addr=node_addr,
+    )
+
+
+def _run_capture(
+    client: F5Client,
+    interface: str,
+    count: int,
+    timeout_sec: int,
+    server_port: Optional[int] = None,
+    node_port: Optional[int] = None,
+    host: Optional[str] = None,
+    client_addr: Optional[str] = None,
+    vs_addr: Optional[str] = None,
+    node_addr: Optional[str] = None,
+    node_members: Optional[list[tuple[str, int]]] = None,
+) -> dict:
+    """Executa a captura e monta o retorno estruturado (comum às ferramentas de
+    tcpdump)."""
     inv = _get_inventory()
-    client = _client_for(device)
     try:
         result = client.tcpdump_capture(
             interface=interface,
             server_port=server_port,
             node_port=node_port,
             host=host,
+            client_addr=client_addr,
+            vs_addr=vs_addr,
+            node_addr=node_addr,
+            node_members=node_members,
             count=count,
             max_count=inv.limits.tcpdump_max_count,
             timeout_sec=timeout_sec,
@@ -276,6 +320,18 @@ def tcpdump_validate_traffic(
 
     packets = tcpdump_parser.parse_tcpdump_output(result.stdout)
     summary = tcpdump_parser.summarize(packets)
+    warnings = describe_tcpdump_warnings(result.stderr)
+    broad_sides = []
+    if server_port is not None and vs_addr is None and client_addr is None and host is None:
+        broad_sides.append(f"server_port {server_port} sem vs_addr/client_addr")
+    if node_port is not None and node_addr is None and host is None:
+        broad_sides.append(f"node_port {node_port} sem node_addr")
+    if broad_sides:
+        warnings.append(
+            "Captura abrangente (" + "; ".join(broad_sides) + "): pega qualquer tráfego "
+            "nessas portas, inclusive de outras conexões. Com IP e porta confirmados, "
+            "repita com vs_addr/client_addr/node_addr para capturar só a conexão validada."
+        )
     return {
         "status": "ok",
         "command": result.command,
@@ -287,8 +343,129 @@ def tcpdump_validate_traffic(
         # Avisos do próprio TMOS sobre concorrência de tcpdump detectados no stderr
         # desta execução (ex: limite de instâncias tmm excedido) — destacados aqui em
         # vez de ficarem enterrados no stderr bruto acima.
-        "warnings": describe_tcpdump_warnings(result.stderr),
+        "warnings": warnings,
     }
+
+
+def _connection_summary(vs: dict) -> dict:
+    return {"vs_name": vs["vs_name"], "description": vs.get("description"),
+            "pool_name": vs.get("pool_name")}
+
+
+@mcp.tool()
+def tcpdump_capture_connection(
+    device: str,
+    connection: str,
+    client_addr: Optional[str] = None,
+    interface: str = "0.0",
+    count: int = 100,
+    timeout_sec: int = 20,
+) -> dict:
+    """Captura (tcpdump, somente leitura) SÓ o tráfego da conexão que o usuário
+    pediu — use esta ferramenta sempre que o pedido citar uma conexão pelo nome
+    (ex: "a conexão da Padaria do Zezinho"), em vez de montar filtros por porta.
+
+    `connection` = o nome da conexão como o usuário disse (ex: "padaria do zezinho"),
+    sem palavras de contexto como "conexão"/"captura". Ele é procurado no nome, na
+    descrição e no pool das Virtual Servers (sem diferenciar maiúsculas/acentos). Para
+    a ÚNICA VS encontrada o agente lê, no próprio F5, o IP:porta numérico da VS e de
+    cada pool member, e captura apenas:
+        (porta da VS E IP da VS [E client_addr]) OU (porta E IP de cada member)
+    `client_addr` (opcional): IP do cliente, se o usuário souber — restringe ainda mais
+    o lado cliente.
+
+    Pedido abrangente — NÃO captura nada e devolve o que validar no lugar:
+      - status 'ambiguous': o nome bate em mais de uma VS. 'candidates' lista cada
+        conexão específica; confirme com o usuário qual validar ou valide UMA POR VEZ,
+        chamando de novo com o vs_name exato de cada candidata — nunca uma captura
+        única cobrindo todas.
+      - status 'not_found': nenhuma VS corresponde; 'available_connections' lista as
+        existentes para o usuário escolher.
+
+    Se um pool member também é usado por outra VS, o lado servidor não tem como ser
+    separado por IP/porta (mesmo destino, mesmo SNAT) — o retorno avisa em 'warnings'
+    quais VS compartilham o member.
+
+    Mesmos limites, guardas e retorno de tcpdump_validate_traffic (um único processo
+    tcpdump no F5, prazo duro, porta 1222 bloqueada, recusa se o F5 já tiver capturas
+    demais rodando)."""
+    client = _client_for(device)
+    vs_all = tmsh_parser.parse_virtual_servers(client.list_virtual_server_config().stdout)
+    matches = tmsh_parser.match_virtual_servers(vs_all, connection)
+    if not matches:
+        return {
+            "status": "not_found",
+            "message": f"Nenhuma Virtual Server corresponde a {connection!r}. Nada foi "
+                       "capturado — confirme com o usuário qual destas conexões validar.",
+            "available_connections": [_connection_summary(vs) for vs in vs_all],
+        }
+    if len(matches) > 1:
+        return {
+            "status": "ambiguous",
+            "message": f"{connection!r} corresponde a {len(matches)} conexões — pedido "
+                       "abrangente demais para uma captura focada. Nada foi capturado: "
+                       "valide uma conexão específica por vez (chame de novo com o "
+                       "vs_name exato) ou confirme com o usuário qual delas.",
+            "candidates": [_connection_summary(vs) for vs in matches],
+        }
+
+    vs = matches[0]
+    connection_info = _connection_summary(vs)
+    if not vs.get("pool_name"):
+        return {"status": "error", "connection": connection_info,
+                "message": f"A VS {vs['vs_name']} não tem pool associado — não há lado "
+                           "servidor definido para focar a captura."}
+
+    vs_addr, vs_port = tmsh_parser.parse_vs_destination(
+        client.show_virtual_servers(vs["vs_name"]).stdout)
+    pool_lists = tmsh_parser.parse_pool_list_members(client.list_pool_config().stdout)
+    own_list = pool_lists.get(vs["pool_name"], [])
+    # Porta numérica vem do `show`; o IP real do node vem do `list` (casados pelo nome
+    # do node) — um node nomeado sem IP no nome ("web01") não vira filtro inválido.
+    node_ip = {m["node"]: m["address"] for m in own_list}
+    node_members = []
+    for m in tmsh_parser.parse_pool_members(client.show_pool(vs["pool_name"]).stdout):
+        node = m["node_name"].rsplit("/", 1)[-1]
+        node_members.append((node_ip.get(node, m["address"]), m["port"]))
+    if vs_addr is None or vs_port is None or not node_members:
+        return {"status": "error", "connection": connection_info,
+                "message": "Não consegui ler o IP:porta da VS e/ou dos pool members no "
+                           "F5 — sem eles a captura não pode ser focada nesta conexão, "
+                           "então nada foi capturado."}
+    connection_info.update(vs_addr=vs_addr, vs_port=vs_port, client_addr=client_addr,
+                           pool_members=[f"{a}:{p}" for a, p in node_members])
+
+    # Members compartilhados com pools de OUTRAS VS: comparados na notação do `list`
+    # (porta numérica ou nome de serviço, a mesma nos dois lados).
+    own = {(m["address"], m["service"]) for m in own_list}
+    shared = []
+    for other in vs_all:
+        other_pool = other.get("pool_name")
+        if other["vs_name"] == vs["vs_name"] or not other_pool or other_pool == vs["pool_name"]:
+            continue
+        common = own & {(m["address"], m["service"]) for m in pool_lists.get(other_pool, [])}
+        if common:
+            shared.append(f"{other['vs_name']} (pool {other_pool}: "
+                          + ", ".join(sorted(f"{a}:{s}" for a, s in common)) + ")")
+
+    try:
+        result = _run_capture(
+            client, interface=interface, count=count, timeout_sec=timeout_sec,
+            server_port=vs_port, vs_addr=vs_addr, client_addr=client_addr,
+            node_members=node_members,
+        )
+    except UnsafeInputError as exc:
+        # IP/porta lidos do F5 que não passam na validação (ex: member em IPv6 com
+        # rota-domínio "%1") — não captura no escuro, devolve o motivo.
+        return {"status": "error", "connection": connection_info, "message": str(exc)}
+    result["connection"] = connection_info
+    if shared and result.get("status") == "ok":
+        result["warnings"].append(
+            "Pool member compartilhado com outra(s) VS: " + "; ".join(shared) + ". No lado "
+            "servidor o tráfego dessas VS tem o mesmo IP/porta/SNAT e pode aparecer na "
+            "captura — o lado cliente (IP:porta da VS) é exclusivo desta conexão."
+        )
+    return result
 
 
 def main() -> None:
