@@ -21,9 +21,11 @@ Uso:
         | python f5_tcpdump.py
     python f5_tcpdump.py --request '{"node_port": 15000}'
 
-Entrada (JSON): interface, server_port, node_port, host, vs_addr, client_addr, node_addr,
-count, timeout_sec (e verbose, detalhes, stan).
-Saida (JSON): status = ok | busy | blocked | invalid | error, mais os campos abaixo.
+Entrada (JSON): server_port, node_port, host, vs_addr, client_addr, node_addr, count,
+timeout_sec (e detalhes, stan). A interface de captura NAO e parametro do cliente.
+Saida (JSON): status = ok | busy | blocked | invalid | error. A resposta traz SO a VS
+pedida e NUNCA comando, stderr, codigo de saida nem detalhe de como a captura funciona:
+falhas voltam como mensagem generica (o detalhe vai para o syslog, tag f5_tcpdump).
 Precisa rodar como root (tcpdump).
 """
 from __future__ import print_function
@@ -70,9 +72,22 @@ BLOCKED_PORTS = {
     1222: "porta de conexão com a captura RISe",
 }
 
-ALLOWED_KEYS = ("interface", "server_port", "node_port", "host", "count", "timeout_sec",
-                "vs_addr", "client_addr", "node_addr", "verbose", "detalhes", "stan")
+ALLOWED_KEYS = ("server_port", "node_port", "host", "count", "timeout_sec",
+                "vs_addr", "client_addr", "node_addr", "detalhes", "stan")
+CAPTURE_INTERFACE = "any"        # fixa: a escolha de interface/VLAN nao e do cliente
+
+# Mensagens que chegam ao cliente: nenhuma cita metodo, comando, caminho ou texto vindo
+# do equipamento.
+MSG_BUSY = ("Não foi possível iniciar a captura agora: há outras capturas em andamento. "
+            "Tente novamente em ~%d minutos." % BUSY_RETRY_MINUTES)
+MSG_CAPTURE_FAILED = "A captura não pôde ser concluída. Tente novamente em alguns minutos."
+MSG_UNAVAILABLE = "A captura não está disponível no momento."
+MSG_INTERNAL = ("Não foi possível concluir a captura. Tente novamente; se persistir, acione "
+                "o administrador do serviço.")
+MSG_CONCURRENT = ("Outra captura rodou ao mesmo tempo no dispositivo; o resultado pode "
+                  "estar incompleto.")
 MAX_TRANSACTIONS = 50
+ATTRIBUTION_WINDOW_S = 2.0   # janela para atribuir a perna do node a uma mensagem/conexao da VS
 ISO_BIT_FIELDS = ("bit7", "bit11", "bit32", "bit37", "bit70", "bit100", "bit127")
 EXPECTED_HOPS = 4        # cliente->VS, F5->node, node->F5, VS->cliente
 STAN_RE = re.compile(r"^[0-9]{1,12}$")
@@ -147,6 +162,15 @@ def blocked_port_message(port):
             "ferramenta." % (port, BLOCKED_PORTS[port]))
 
 
+def _shown(value):
+    """Valor do cliente para mensagem: JSON (aspas duplas, ASCII) - igual em Python 2 e 3,
+    sem o prefixo u"..." do repr() de unicode do Python 2."""
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return json.dumps("?")
+
+
 def _is_string(value):
     try:
         return isinstance(value, basestring)  # noqa: F821 (python 2)
@@ -157,13 +181,13 @@ def _is_string(value):
 def _to_int(value, name, low, high):
     """Aceita int ou string de digitos (com espacos); recusa bool/float/outros."""
     if isinstance(value, bool):
-        raise RequestError("invalid", "Valor inválido para '%s': %r" % (name, value))
+        raise RequestError("invalid", "Valor inválido para '%s': %s" % (name, _shown(value)))
     if isinstance(value, numbers.Integral):
         number = int(value)
     elif _is_string(value) and value.strip().isdigit():
         number = int(value.strip())
     else:
-        raise RequestError("invalid", "Valor inválido para '%s': %r" % (name, value))
+        raise RequestError("invalid", "Valor inválido para '%s': %s" % (name, _shown(value)))
     if number < low or number > high:
         raise RequestError(
             "invalid", "'%s' deve estar entre %d e %d (recebido %d)" % (name, low, high, number))
@@ -191,7 +215,8 @@ def _to_ip(value, name):
                     return text
                 except (socket.error, ValueError):
                     pass
-    raise RequestError("invalid", "'%s' deve ser um endereço IPv4/IPv6 literal: %r" % (name, value))
+    raise RequestError("invalid", "'%s' deve ser um endereço IPv4/IPv6 literal: %s"
+                       % (name, _shown(value)))
 
 
 def validate_request(request):
@@ -199,13 +224,9 @@ def validate_request(request):
     politica. Retorna um dict com os campos normalizados."""
     if not isinstance(request, dict):
         raise RequestError("invalid", "O pedido deve ser um objeto JSON.")
-    unknown = sorted(repr(k) for k in request if k not in ALLOWED_KEYS)
+    unknown = sorted(_shown(k) for k in request if k not in ALLOWED_KEYS)
     if unknown:
         raise RequestError("invalid", "Parâmetro(s) não suportado(s): %s" % ", ".join(unknown))
-
-    interface = request.get("interface", "any")
-    if not _is_string(interface) or not INTERFACE_RE.match(interface):
-        raise RequestError("invalid", "Interface inválida: %r" % (interface,))
 
     # portas primeiro: um pedido na 1222 e recusado antes de qualquer outra coisa
     server_port = request.get("server_port")
@@ -230,29 +251,26 @@ def validate_request(request):
     if node_addr is not None and node_port is None:
         raise RequestError("invalid", "'node_addr' exige 'node_port' (porta do node).")
 
-    verbose = request.get("verbose", False)
-    if not isinstance(verbose, bool):
-        raise RequestError("invalid", "'verbose' deve ser true ou false: %r" % (verbose,))
     detalhes = request.get("detalhes", False)
     if not isinstance(detalhes, bool):
-        raise RequestError("invalid", "'detalhes' deve ser true ou false: %r" % (detalhes,))
+        raise RequestError("invalid", "'detalhes' deve ser true ou false: %s" % _shown(detalhes))
     stan = request.get("stan")
     if stan is not None:
         if isinstance(stan, bool) or not (_is_string(stan) or isinstance(stan, numbers.Integral)):
-            raise RequestError("invalid", "'stan' deve ser o STAN (1 a 12 digitos): %r" % (stan,))
+            raise RequestError("invalid", "'stan' deve ser o STAN (1 a 12 digitos): %s" % _shown(stan))
         stan = str(stan).strip()
         if not STAN_RE.match(stan):
-            raise RequestError("invalid", "'stan' deve ter de 1 a 12 digitos: %r" % (stan,))
+            raise RequestError("invalid", "'stan' deve ter de 1 a 12 digitos: %s" % _shown(stan))
 
     count = _to_int(request.get("count", DEFAULT_COUNT), "count", 1, MAX_COUNT)
     timeout_sec = _to_int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC), "timeout_sec",
                           1, MAX_TIMEOUT_SEC)
 
     return {
-        "interface": str(interface), "server_port": server_port, "node_port": node_port,
+        "interface": CAPTURE_INTERFACE, "server_port": server_port, "node_port": node_port,
         "host": host, "count": count, "timeout_sec": timeout_sec,
         "vs_addr": vs_addr, "client_addr": client_addr, "node_addr": node_addr,
-        "verbose": verbose, "detalhes": detalhes, "stan": stan,
+        "detalhes": detalhes, "stan": stan,
     }
 
 
@@ -317,7 +335,7 @@ def _assert_argv_safe(argv, params):
     tail = argv[argv.index("--") + 1:]
     for position, token in enumerate(tail):
         if token not in keywords and token not in allowed_values:
-            raise RequestError("invalid", "Token inesperado no filtro: %r" % (token,))
+            raise RequestError("invalid", "Parâmetros fora do permitido para a captura.")
         if token == "port" and position + 1 < len(tail):
             value = tail[position + 1]
             if value.isdigit() and int(value) in BLOCKED_PORTS:
@@ -369,14 +387,9 @@ def _open_guard(lock_dir, wait_sec):
 
 
 def _busy_error(running):
-    return RequestError(
-        "busy",
-        "Já existem %s captura(s) tcpdump em execução em %s — iniciar mais uma "
-        "passaria do teto de %d simultâneas. A ferramenta não inicia uma nova captura "
-        "nem interrompe as existentes — tente novamente em ~%d minutos."
-        % (running, socket.gethostname(), MAX_CONCURRENT_TCPDUMP, BUSY_RETRY_MINUTES),
-        retry_after_minutes=BUSY_RETRY_MINUTES,
-    )
+    _log_internal("captura recusada (busy): %s em execucao, teto %d"
+                  % (running, MAX_CONCURRENT_TCPDUMP))
+    return RequestError("busy", MSG_BUSY, retry_after_minutes=BUSY_RETRY_MINUTES)
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +722,7 @@ def focus_vs_traffic(packets, server_port=None, node_port=None, vs_addr=None):
     que divide o IP da VS ou o node (ex: VS :15000 no mesmo IP, pool com o mesmo
     member) e e descartado. Devolve (pacotes mantidos, info)."""
     info = {"separated": False, "probe_flows": 0, "probe_packets": 0,
-            "other_flows": 0, "other_packets": 0}
+            "other_flows": 0, "other_packets": 0, "probe_pkts": []}
     if server_port is not None and vs_addr is not None:
         vs_endpoint = "%s.%d" % (vs_addr, server_port)
 
@@ -726,14 +739,41 @@ def focus_vs_traffic(packets, server_port=None, node_port=None, vs_addr=None):
     for pkt in packets:
         flows.setdefault(_flow_key(pkt), []).append(pkt)
 
+    # Quando cada conexao da VS comecou (por porta efemera do cliente) e quando cada
+    # mensagem (STAN + MTI) passou pelo lado da VS: a perna do node so e "desta VS" se
+    # bater COM proximidade de tempo - STAN repetido entre VS (comum: contador por
+    # terminal) nao pode puxar a conexao de outra VS para esta resposta.
     vs_flows = set()
-    vs_stans = set()
-    client_ports = set()
+    vs_start_by_port = {}
+    vs_time_by_msg = {}
     for key, pkts in flows.items():
         if any(is_vs_endpoint(e) for e in key):
             vs_flows.add(key)
-            vs_stans.update(p["bit11"] for p in pkts if p.get("mti") and p.get("bit11"))
-            client_ports.update(_endpoint_parts(e)[1] for e in key if not is_vs_endpoint(e))
+            first = _seconds(pkts[0]["time"])
+            for e in key:
+                if not is_vs_endpoint(e):
+                    vs_start_by_port.setdefault(_endpoint_parts(e)[1], []).append(first)
+            for p in pkts:
+                if p.get("mti") and p.get("bit11"):
+                    vs_time_by_msg.setdefault((p["bit11"], p["mti"]), []).append(
+                        _seconds(p["time"]))
+
+    def near(moment, times):
+        return any(moment is None or t is None or abs(moment - t) <= ATTRIBUTION_WINDOW_S
+                   for t in times)
+
+    def belongs_to_vs(pkts, key):
+        for p in pkts:
+            if p.get("mti") and p.get("bit11"):
+                times = vs_time_by_msg.get((p["bit11"], p["mti"]))
+                if times and near(_seconds(p["time"]), times):
+                    return True
+        started = _seconds(pkts[0]["time"])
+        for e in key:
+            port = _endpoint_parts(e)[1]
+            if port in vs_start_by_port and near(started, vs_start_by_port[port]):
+                return True
+        return False
 
     keep = set(vs_flows)
     for key, pkts in flows.items():
@@ -744,13 +784,50 @@ def focus_vs_traffic(packets, server_port=None, node_port=None, vs_addr=None):
         if probe:
             info["probe_flows"] += 1
             info["probe_packets"] += len(pkts)
-        elif (any(p.get("bit11") in vs_stans for p in pkts if p.get("mti") and p.get("bit11"))
-              or any(_endpoint_parts(e)[1] in client_ports for e in key)):
+            info["probe_pkts"].extend(pkts)
+        elif belongs_to_vs(pkts, key):
             keep.add(key)
         else:
             info["other_flows"] += 1
             info["other_packets"] += len(pkts)
     return [p for p in packets if _flow_key(p) in keep], info
+
+
+def member_health(packets, members):
+    """Como cada membro do pool da VS respondeu as aberturas de conexao vistas na captura
+    (sondas do monitor + conexoes da propria VS): SYN-ACK do membro -> "responde ao SYN";
+    RST do membro -> "recusa a conexao (RST)"; so SYN -> "nao responde ao SYN (sem
+    SYN-ACK)"; nada -> "sem tentativas de abertura na janela". `members` =
+    [(ip | None, porta)]; com ip None casa so pela porta. So os membros da VS pedida."""
+    out = []
+    for addr, port in members:
+        wanted = "%s.%d" % (addr, port) if addr else None
+
+        def is_member(endpoint, wanted=wanted, port=port):
+            if wanted is not None:
+                return endpoint == wanted
+            return _endpoint_parts(endpoint)[1] == port
+
+        syn = syn_ack = rst = 0
+        for pkt in packets:
+            label = pkt["flags_label"]
+            if label == "SYN" and is_member(pkt["dst"]):
+                syn += 1
+            elif label == "SYN-ACK" and is_member(pkt["src"]):
+                syn_ack += 1
+            elif label in ("RST", "RST-ACK") and is_member(pkt["src"]):
+                rst += 1
+        if syn_ack:
+            situation = "responde ao SYN"
+        elif rst:
+            situation = "recusa a conexão (RST)"
+        elif syn:
+            situation = "não responde ao SYN (sem SYN-ACK)"
+        else:
+            situation = "sem tentativas de abertura na janela"
+        out.append({"membro": ("%s:%d" % (addr, port)) if addr else ("porta %d" % port),
+                    "situacao": situation, "syn": syn, "syn_ack": syn_ack, "rst": rst})
+    return out
 
 
 def _is_response_mti(mti):
@@ -827,7 +904,7 @@ def build_transactions(packets, detail=False):
     return out
 
 
-def render_details_markdown(transactions, vs_label):
+def render_details_markdown(transactions, vs_label, members=None):
     """Tabela no padrao pedido (# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio) +
     observacoes, pronta para ser apresentada como esta. Todo valor interpolado passa por
     str(): em Python 2 o decode() devolve unicode e misturar com literal acentuado
@@ -863,12 +940,31 @@ def render_details_markdown(transactions, vs_label):
     complete = sum(1 for t in transactions if t["saltos"] >= EXPECTED_HOPS)
     lines.append("- **Rastreio:** %d de %d com os %d saltos (cliente→VS, F5→node, node→F5, "
                  "VS→cliente)" % (complete, total, EXPECTED_HOPS))
+    if members:
+        lines.append("- **Membros do pool:** " + "; ".join(
+            "%s %s" % (str(m["membro"]), m["situacao"]) for m in members))
     return "\n".join(lines)
 
 
-def _verdict(kept, summary, transactions, flows):
+def _members_sentence(members, with_ok):
+    """Frase sobre a saude dos membros do pool da VS (so os que falham; com with_ok,
+    tambem "responderam" quando todos respondem)."""
+    if not members:
+        return ""
+    failing = [m for m in members
+               if m["situacao"].startswith(("não responde", "recusa"))]
+    if failing:
+        return " " + " ".join(
+            "Membro %s %s (%d SYN, %d SYN-ACK)." % (
+                str(m["membro"]), m["situacao"], m["syn"], m["syn_ack"]) for m in failing)
+    if with_ok and any(m["syn"] or m["syn_ack"] for m in members):
+        return " Os membros do pool responderam ao SYN."
+    return ""
+
+
+def _verdict(kept, summary, transactions, flows, members=None):
     if not kept:
-        return "Nenhum tráfego da VS na janela capturada."
+        return "Nenhum tráfego da VS na janela capturada." + _members_sentence(members, True)
     if transactions:
         answered = sum(1 for t in transactions if t["respondida"])
         kinds = {}
@@ -879,27 +975,29 @@ def _verdict(kept, summary, transactions, flows):
             kinds[label] = kinds.get(label, 0) + 1
         mix = ", ".join("%d×%s" % (n, mti) for mti, n in sorted(kinds.items()))
         return ("%d transação(ões) ISO 8583 na VS (%s): %d respondida(s), %d sem resposta."
-                % (len(transactions), mix, answered, len(transactions) - answered))
+                % (len(transactions), mix, answered, len(transactions) - answered)
+                + _members_sentence(members, False))
     text = ("Tráfego da VS observado (%d pacotes em %d conexão(ões)), sem mensagens "
             "ISO 8583 reconhecidas." % (len(kept), flows))
     if summary["syn"] and not summary["syn_ack"]:
         text += " Houve SYN sem nenhum SYN-ACK: o destino não respondeu à abertura."
-    return text
+    return text + _members_sentence(members, False)
 
 
 def simplified_view(packets, server_port=None, node_port=None, vs_addr=None,
-                    detalhes=False, stan=None):
+                    detalhes=False, stan=None, members=None):
     """Veredito, contagens e transacoes so do trafego da VS. Com detalhes, cada transacao
     traz campos ISO, trajeto e RTT e a visao inclui tabela_markdown; stan restringe a
     transacoes com esse STAN. Devolve (visao, avisos)."""
     kept, info = focus_vs_traffic(packets, server_port, node_port, vs_addr)
+    health = member_health(kept + info["probe_pkts"], members) if members else None
     summary = summarize(kept)
     flows = set(_flow_key(p) for p in kept)
     transactions = build_transactions(kept, detail=detalhes)
     if stan is not None:
         transactions = [t for t in transactions if t["stan"] == stan]
     view = {
-        "resultado": _verdict(kept, summary, transactions, len(flows)),
+        "resultado": _verdict(kept, summary, transactions, len(flows), health),
         "trafego": {
             "conexoes": len(flows),
             "pacotes": len(kept),
@@ -911,6 +1009,8 @@ def simplified_view(packets, server_port=None, node_port=None, vs_addr=None,
         },
         "transacoes": transactions[:MAX_TRANSACTIONS],
     }
+    if health is not None:
+        view["membros"] = health
     if len(transactions) > MAX_TRANSACTIONS:
         view["transacoes_omitidas"] = len(transactions) - MAX_TRANSACTIONS
     if stan is not None and not transactions:
@@ -922,16 +1022,11 @@ def simplified_view(packets, server_port=None, node_port=None, vs_addr=None,
             label = "VS, porta %d" % server_port
         else:
             label = "VS"
-        view["tabela_markdown"] = render_details_markdown(view["transacoes"], label)
+        view["tabela_markdown"] = render_details_markdown(view["transacoes"], label, health)
 
+    # O que foi descartado (sondas do monitor, conexoes que nao sao da VS pedida) NAO
+    # e reportado: a resposta traz so a VS pedida, sem contexto de outras conexoes.
     notes = []
-    if info["probe_flows"]:
-        notes.append("%d sonda(s) do monitor do pool (%d pacotes) foram ignoradas: não são "
-                     "tráfego da VS." % (info["probe_flows"], info["probe_packets"]))
-    if info["other_flows"]:
-        notes.append("%d conexão(ões) de outra(s) VS que dividem o IP da VS ou o node (%d "
-                     "pacotes) foram ignoradas: não são da VS pedida." % (
-                         info["other_flows"], info["other_packets"]))
     if not info["separated"] and kept:
         notes.append("Não foi possível separar o tráfego da VS do restante (informe vs_addr "
                      "junto de server_port, ou use portas de VS e de node diferentes): nada "
@@ -942,6 +1037,17 @@ def simplified_view(packets, server_port=None, node_port=None, vs_addr=None,
 # ---------------------------------------------------------------------------
 # Orquestracao
 # ---------------------------------------------------------------------------
+
+def _log_internal(message):
+    """Detalhe tecnico (nunca devolvido ao cliente): syslog, tag f5_tcpdump."""
+    if syslog is None:
+        return
+    try:
+        syslog.openlog("f5_tcpdump", 0, syslog.LOG_AUTH)
+        syslog.syslog(syslog.LOG_WARNING, str(message)[:900])
+    except Exception:
+        pass
+
 
 def _audit(request, response):
     if syslog is None:
@@ -963,8 +1069,9 @@ def run(request, tcpdump_bin=None, lock_dir=None, proc_dir="/proc",
     except RequestError as exc:
         response = {"status": exc.status, "message": exc.message}
         response.update(exc.extra)
-    except Exception as exc:  # falha inesperada: informa, nao derruba o chamador
-        response = {"status": "error", "message": "%s: %s" % (type(exc).__name__, exc)}
+    except Exception as exc:  # falha inesperada: resposta generica, nao derruba o chamador
+        _log_internal("erro inesperado: %s: %s" % (type(exc).__name__, exc))
+        response = {"status": "error", "message": MSG_INTERNAL}
     if audit:
         _audit(request, response)
     return response
@@ -974,8 +1081,10 @@ def _run(request, tcpdump_bin, lock_dir, proc_dir, guard_wait_sec):
     params = validate_request(request)
 
     binary = tcpdump_bin or _find_tcpdump()
-    if not binary:
-        raise RequestError("error", "tcpdump não encontrado em: %s" % ", ".join(TCPDUMP_CANDIDATES))
+    if not binary or not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        _log_internal("tcpdump nao encontrado/executavel (%s); candidatos: %s"
+                      % (binary, ", ".join(TCPDUMP_CANDIDATES)))
+        raise RequestError("error", MSG_UNAVAILABLE)
     argv = build_argv(params, binary)
 
     guard = _open_guard(lock_dir, guard_wait_sec)
@@ -997,50 +1106,44 @@ def _run(request, tcpdump_bin, lock_dir, proc_dir, guard_wait_sec):
     # outro codigo e falha do proprio tcpdump (interface inexistente, filtro...) e
     # nao pode virar "ok" com zero pacotes.
     if status not in (0, 124):
-        raise RequestError(
-            "error",
-            "O tcpdump falhou (exit_status=%s): %s" % (
-                status, stderr_text.strip()[-500:] or "sem stderr"),
-            command=" ".join(argv), exit_status=status)
+        _log_internal("captura falhou: exit_status=%s stderr=%s"
+                      % (status, stderr_text.strip()[-500:] or "sem stderr"))
+        raise RequestError("error", MSG_CAPTURE_FAILED)
 
     warnings = []
-    for line in stderr_text.splitlines():
-        if TMM_WARNING_MARKER in line:
-            warnings.append(
-                "O F5 reportou concorrência de tcpdump acima do recomendado durante "
-                "esta captura: %r. Considere aguardar ~%d minutos antes de rodar outra."
-                % (line.strip(), BUSY_RETRY_MINUTES))
+    if TMM_WARNING_MARKER in stderr_text:
+        _log_internal("aviso de concorrencia na captura: %s" % stderr_text.strip()[-300:])
+        warnings.append(MSG_CONCURRENT)
 
-    if not params["verbose"]:
-        view, notes = simplified_view(
-            packets, server_port=params["server_port"], node_port=params["node_port"],
-            vs_addr=params["vs_addr"], detalhes=params["detalhes"], stan=params["stan"])
-        simple = {
-            "status": "ok",
-            "resultado": view["resultado"],
-            "janela": {"max_s": params["timeout_sec"],
-                       "encerrou_por": "prazo" if timed_out else "limite de pacotes"},
-            "trafego": view["trafego"],
-            "transacoes": view["transacoes"],
-            "avisos": warnings + notes,
-        }
-        if "transacoes_omitidas" in view:
-            simple["transacoes_omitidas"] = view["transacoes_omitidas"]
-        if "tabela_markdown" in view:
-            simple["tabela_markdown"] = view["tabela_markdown"]
-        return simple
-
-    return {
+    # membro do pool a analisar: o IP do node (node_addr ou host) com node_port; so pela
+    # porta quando as portas da VS e do node diferem. Mesma porta e sem IP: nao separa.
+    node_ip = params["node_addr"] or params["host"]
+    if params["node_port"] is not None and node_ip:
+        members = [(node_ip, params["node_port"])]
+    elif params["node_port"] is not None and params["node_port"] != params["server_port"]:
+        members = [(None, params["node_port"])]
+    else:
+        members = None
+    view, notes = simplified_view(
+        packets, server_port=params["server_port"], node_port=params["node_port"],
+        vs_addr=params["vs_addr"], detalhes=params["detalhes"], stan=params["stan"],
+        members=members)
+    simple = {
         "status": "ok",
-        "command": " ".join(argv),
-        "exit_status": status,
-        "timed_out": timed_out,
-        "summary": summarize(packets),
-        "packets": packets[:MAX_PACKETS_RETURNED],
-        "packet_count_truncated": len(packets) > MAX_PACKETS_RETURNED,
-        "stderr": stderr_text,
-        "warnings": warnings,
+        "resultado": view["resultado"],
+        "janela": {"max_s": params["timeout_sec"],
+                   "encerrou_por": "prazo" if timed_out else "limite de pacotes"},
+        "trafego": view["trafego"],
+        "transacoes": view["transacoes"],
+        "avisos": warnings + notes,
     }
+    if "transacoes_omitidas" in view:
+        simple["transacoes_omitidas"] = view["transacoes_omitidas"]
+    if "membros" in view:
+        simple["membros"] = view["membros"]
+    if "tabela_markdown" in view:
+        simple["tabela_markdown"] = view["tabela_markdown"]
+    return simple
 
 
 def main(argv=None):
@@ -1051,14 +1154,13 @@ def main(argv=None):
     elif not argv:
         raw = sys.stdin.read()
     else:
-        print(json.dumps({"status": "invalid",
-                          "message": "Uso: f5_tcpdump.py [--request JSON]  (ou JSON no stdin)"}))
+        print(json.dumps({"status": "invalid", "message": "Pedido inválido."}))
         return 2
 
     try:
         request = json.loads(raw)
-    except ValueError as exc:
-        print(json.dumps({"status": "invalid", "message": "JSON inválido: %s" % exc}))
+    except ValueError:
+        print(json.dumps({"status": "invalid", "message": "O pedido deve ser um JSON válido."}))
         return 2
 
     print(json.dumps(run(request), sort_keys=True))

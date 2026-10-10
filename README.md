@@ -125,24 +125,36 @@ mesma imagem `f5-mcp-agent:latest` com os mesmos volumes/env acima.
 
 ## 6. Ferramentas expostas
 
-| Ferramenta | O que faz |
+| Ferramenta | O que devolve |
 |---|---|
-| `list_devices` | Lista devices do inventário (sem credenciais) |
-| `get_virtual_server_status` | `tmsh show ltm virtual` — status/estatísticas |
-| `get_virtual_server_config` | `tmsh list ltm virtual` — destino/porta/pool |
-| `get_pool_status` | `tmsh show ltm pool ... members detail` — disponibilidade dos members |
-| `get_sys_connections` | `tmsh show sys connection` com filtros opcionais |
-| `get_baseline_from_excel` | Lê baseline de propósito de um `.xlsx` em `data/` |
-| `get_baseline_from_sheets` | Lê baseline de uma Google Sheet (opcional) |
-| `compare_vs_with_excel_baseline` | Diff completo: todas as VS do device x baseline Excel |
-| `compare_vs_with_sheets_baseline` | Igual, com baseline via Sheets |
-| `compare_pool_members_with_baseline` | Diff de members de um pool x lista esperada |
-| `tcpdump_validate_traffic` | Captura + parsing de SYN/SYN-ACK/RST/ACK e marcadores `0800`/`0810` |
+| `list_devices` | Só os **nomes** dos dispositivos (sem host, porta, partição ou tags) |
+| `get_virtual_server_status` | Por VS: disponibilidade, estado, motivo, destino, conexões (atuais/máx/total) e tráfego |
+| `get_virtual_server_config` | Por VS: destino, porta/serviço, protocolo, pool, descrição, habilitada, perfis, persistência, SNAT e regras |
+| `get_pool_status` | Pool de uma VS (`pool_name` ou `vs_name`) e cada membro: endereço, porta, disponibilidade, estado e motivo |
+| `get_sys_connections` | Conexões ativas filtradas por cliente/VS (exige ao menos um filtro; até 100) |
+| `get_baseline_from_excel` / `get_baseline_from_sheets` | Baseline de propósito de cada VS |
+| `compare_vs_with_excel_baseline` / `compare_vs_with_sheets_baseline` | Diff: todas as VS x baseline |
+| `compare_pool_members_with_baseline` | Diff de membros de um pool x lista esperada |
+| `tcpdump_validate_traffic` | Captura focada numa VS: veredito, contagens, transações ISO 8583 por STAN (`detalhes=true` → tabela) e `membros` (se cada membro do pool responde ao SYN) |
+| `tcpdump_capture_connection` | Idem, achando a VS pelo nome dito pelo usuário |
 
-Todas retornam também o comando exato executado (`command`) e, quando aplicável, a
-saída bruta (`raw`/`stdout`) para conferência manual — o parsing é "melhor esforço"
-porque a formatação exata do `tmsh`/`tcpdump` varia por versão de TMOS.
+### Política de segurança da saída
 
+O MCP expõe **só status e configuração de Virtual Servers** (e do pool, membros e
+conexões delas). Nada da configuração do dispositivo — NTP, ARP, VLANs, rede,
+autenticação, sistema — é consultado (a allowlist de comandos de
+[src/safety.py](src/safety.py) não contém nada disso) nem devolvido. As respostas
+**não** trazem comando executado, saída bruta, `stderr`, código de saída, host/porta/
+credenciais nem detalhe de como o agente se conecta; as descrições das ferramentas
+(visíveis ao modelo) seguem a mesma regra e os erros chegam ao cliente como mensagens
+genéricas (o detalhe técnico vai só para o log do servidor, no stderr do container).
+A escolha de interface/VLAN da captura não é parâmetro do cliente.
+A API onboard (`onbox/`, REST no próprio F5) segue **a mesma política**: sem
+`verbose`/`interface`, sem comando/stderr/caminhos nas respostas, mensagens genéricas
+e só o tráfego da VS pedida (nada de outras VS, pools ou sondas do monitor).
+`src/_selftest.py` varre respostas, erros e descrições por termos proibidos.
+
+O parsing é "melhor esforço": a formatação do `tmsh`/`tcpdump` varia por versão de TMOS.
 ## 7. Testar sem um F5 real
 
 ```bash

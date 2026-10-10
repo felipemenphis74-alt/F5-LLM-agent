@@ -198,6 +198,289 @@ Ltm::Pool: pool_app3_17000
 """
 
 
+SAMPLE_VS_LIST_FULL = """ltm virtual vs_full_443 {
+    description "Portal"
+    destination /Common/10.1.1.10:443
+    ip-protocol tcp
+    mask 255.255.255.255
+    persist {
+        /Common/source_addr {
+            default yes
+        }
+    }
+    pool /Common/pool_web_443
+    profiles {
+        /Common/http { }
+        /Common/tcp { }
+    }
+    rules {
+        /Common/redirect_irule
+    }
+    source 0.0.0.0/0
+    source-address-translation {
+        pool /Common/snat_pool_a
+        type snat
+    }
+    translate-address enabled
+    translate-port enabled
+}
+ltm virtual vs_off_80 {
+    destination 10.1.1.11:http
+    disabled
+    ip-protocol tcp
+    pool pool_off
+    source-address-translation {
+        type automap
+    }
+}
+"""
+
+SAMPLE_VS_STATUS = """
+Ltm::Virtual Server: vs_app1_15000
+------------------------------------------------------------
+Status
+  Availability     : available
+  State            : enabled
+  Reason           : The virtual server is available
+  CMP              : enabled
+  CMP Mode         : all-cpus
+  Destination      : 10.100.1.10:15000
+  PVA Acceleration : none
+
+Traffic                             ClientSide  Ephemeral  General
+  Bits In                                 8.8K          0        -
+  Bits Out                                8.8K          0        -
+  Packets In                                24          0        -
+  Packets Out                               24          0        -
+  Current Connections                        0          0        -
+  Maximum Connections                        2          0        -
+  Total Connections                         12          0        -
+  Total Software Accepted                    0
+"""
+
+SAMPLE_POOL_STATUS = """
+Ltm::Pool: pool_app1_15000
+------------------------------------------------------------
+Status
+  Availability           : available
+  State                  : enabled
+  Reason                 : The pool is available
+  Monitor                : tcp_half_open
+  Minimum Active Members : 0
+Traffic                  ServerSide
+  Current Connections    0
+  |   Ltm::Pool Member: node_app_10.100.2.1:15000
+  |   Status
+  |   Availability   : offline
+  |   State          : enabled
+  |   Reason         : tcp_half_open: No successful responses received before deadline.
+  |   Monitor        : tcp_half_open (pool monitor)
+  |   Ltm::Pool Member: node_app_192.168.0.9:15000
+  |   Availability   : available
+  |   State          : enabled
+  |   Reason         : Pool member is available
+"""
+
+SAMPLE_SYS_CONNECTIONS = """Sys::Connections
+10.100.1.20:4598  10.100.2.1:15000  10.100.1.20:15691  10.100.2.1:15000  tcp  4  (tmm: 0)  none  none
+192.168.0.9:50000  10.100.1.10:17000  10.100.1.20:50000  192.168.0.9:15000  tcp  7  (tmm: 1)  none  none
+
+Total records returned: 2
+"""
+
+# Saída com lixo de configuração do dispositivo (NTP/ARP/VLAN/autenticação) misturado:
+# nada disso pode sobreviver aos parsers.
+SAMPLE_NOISE = """
+sys ntp { servers { 10.9.9.9 } timezone America/Sao_Paulo }
+net arp 10.1.1.1 { ip-address 10.1.1.1 mac-address 00:11:22:33:44:55 }
+net vlan external { interface 1.1 tag 4094 }
+auth user admin { encrypted-password $6$secretsalt$hash }
+"""
+
+
+FORBIDDEN_IN_OUTPUT = (
+    "tmsh", "ssh", "paramiko", "perl", "bash", "stderr", "exit_status", "command",
+    "known_hosts", "inventory", "docker", "/app/", "password", "senha", "F5_PROD",
+    "secretsalt", "00:11:22:33:44:55", "4094", "Sao_Paulo", "10.9.9.9",
+    "192.0.2.1",          # host do dispositivo de teste
+)
+FORBIDDEN_WORDS_RE = r"\b(ntp|arp|vlan|tmm|cmp)\b"
+
+
+def _assert_clean(label, value):
+    import re
+    text = json.dumps(value, ensure_ascii=False)
+    for term in FORBIDDEN_IN_OUTPUT:
+        assert term.lower() not in text.lower(), f"{label}: vazou {term!r}: {text[:300]}"
+    assert not re.search(FORBIDDEN_WORDS_RE, text, re.I), f"{label}: termo de dispositivo: {text[:300]}"
+
+
+def _security_checks(device, real_client):
+    import asyncio
+
+    import paramiko
+    from . import baseline_excel, server
+    from .f5_client import F5ConnectionError
+    from .inventory import InventoryError
+
+    print("== segurança: allowlist só de VS/pool/conexões (nada do dispositivo) ==")
+    for cmd in ("tmsh show net vlan", "tmsh list net vlan", "tmsh show net arp",
+                "tmsh list net self", "tmsh list sys ntp", "tmsh list sys global-settings",
+                "tmsh list auth user", "tmsh list auth remote-role", "tmsh show sys version",
+                "tmsh list sys dns", "tmsh list ltm virtual-address",
+                "tmsh show ltm virtual-address", "tmsh list ltm node", "tmsh show ltm pool-x"):
+        try:
+            safety.assert_safe_tmsh_command(cmd)
+            raise AssertionError(f"deveria recusar: {cmd}")
+        except safety.CommandNotAllowedError:
+            pass
+    for cmd in ("tmsh list ltm virtual", "tmsh list ltm virtual vs_a",
+                "tmsh show ltm virtual vs_a", "tmsh show ltm pool pool_a members detail",
+                "tmsh list ltm pool", "tmsh show sys connection cs-server-port 17000"):
+        assert safety.assert_safe_tmsh_command(cmd) == cmd
+    print("OK: 14 comandos de dispositivo/rede/autenticação recusados; os de VS/pool passam")
+
+    print("== tmsh parser: config e status só da VS ==")
+    cfg = {v["vs_name"]: v for v in tmsh_parser.parse_virtual_servers(SAMPLE_VS_LIST_FULL)}
+    full = cfg["vs_full_443"]
+    assert (full["port"], full["ip_protocol"], full["enabled"], full["service"]) == \
+        (443, "tcp", True, None), full
+    assert full["profiles"] == ["http", "tcp"] and full["persistence"] == ["source_addr"], full
+    assert full["rules"] == ["redirect_irule"], full
+    assert full["snat"] == {"type": "snat", "pool": "snat_pool_a"}, full
+    assert full["pool_name"] == "/Common/pool_web_443" and full["description"] == "Portal", full
+    off = cfg["vs_off_80"]
+    assert (off["port"], off["service"], off["enabled"], off["profiles"]) == \
+        (None, "http", False, []), off
+    assert off["snat"] == {"type": "automap"}, off
+
+    status = tmsh_parser.parse_vs_status(SAMPLE_VS_STATUS + SAMPLE_NOISE)
+    assert status == [{
+        "vs_name": "vs_app1_15000", "availability": "available", "state": "enabled",
+        "reason": "The virtual server is available", "destination": "10.100.1.10:15000",
+        "connections": {"current": 0, "max": 2, "total": 12},
+        "traffic": {"bits_in": "8.8K", "bits_out": "8.8K", "packets_in": "24",
+                    "packets_out": "24"}}], status
+    pool = tmsh_parser.parse_pool_status(SAMPLE_POOL_STATUS)
+    assert pool["availability"] == "available" and pool["reason"] == "The pool is available", pool
+    assert [(m["address"], m["port"], m["availability"]) for m in pool["members"]] == \
+        [("10.100.2.1", 15000, "offline"), ("192.168.0.9", 15000, "available")], pool
+    assert "tcp_half_open" in pool["members"][0]["reason"], pool
+    assert set(pool) == {"availability", "state", "reason", "members"}, pool
+    assert all(set(m) == {"address", "port", "availability", "state", "reason"}
+               for m in pool["members"]), pool
+    rows = tmsh_parser.parse_sys_connections(SAMPLE_SYS_CONNECTIONS)
+    assert rows[1] == {"client": "192.168.0.9:50000", "virtual_server": "10.100.1.10:17000",
+                       "snat": "10.100.1.20:50000", "node": "192.168.0.9:15000",
+                       "protocol": "tcp", "idle_s": 7}, rows
+    print("OK: VS (perfis/persistência/SNAT/regras), status, pool e conexões sem campos internos")
+
+    print("== segurança: respostas das ferramentas não trazem método nem config do dispositivo ==")
+
+    class SweepClient:
+        def show_virtual_servers(self, vs_name=None):
+            return CommandResult("c", SAMPLE_VS_STATUS + SAMPLE_NOISE, "stderr-secret", 0)
+
+        def list_virtual_server_config(self, vs_name=None):
+            return CommandResult("c", SAMPLE_VS_LIST_FULL + SAMPLE_NOISE, "", 0)
+
+        def show_pool(self, pool_name=None):
+            return CommandResult("c", SAMPLE_POOL_STATUS + SAMPLE_NOISE, "", 0)
+
+        def list_pool_config(self, pool_name=None):
+            return CommandResult("c", SAMPLE_POOL_LIST, "", 0)
+
+        def show_sys_connections(self, *args, **kwargs):
+            return CommandResult("c", SAMPLE_SYS_CONNECTIONS + SAMPLE_NOISE, "", 0)
+
+        def tcpdump_capture(self, **kwargs):
+            return CommandResult("c", SAMPLE_TCPDUMP, "WARNING - The recommended number of "
+                                 "tmm tcpdump instances (2) has been exceeded", 124)
+
+    server._get_inventory = lambda: SimpleNamespace(
+        limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=60,
+                               ssh_connect_timeout_sec=5, command_timeout_sec=5),
+        list_devices=lambda: [device])
+    server._client_for = lambda name: SweepClient()
+    outputs = {
+        "list_devices": server.list_devices(),
+        "get_virtual_server_status": server.get_virtual_server_status("d", "vs_full_443"),
+        "get_virtual_server_config": server.get_virtual_server_config("d"),
+        "get_pool_status": server.get_pool_status("d", vs_name="vs_full_443"),
+        "get_sys_connections": server.get_sys_connections("d", server_port=17000),
+        "tcpdump_validate_traffic": server.tcpdump_validate_traffic(
+            "d", server_port=443, node_port=8443, count=10, timeout_sec=5),
+        "tcpdump_validate_traffic(detalhes)": server.tcpdump_validate_traffic(
+            "d", server_port=443, node_port=8443, count=10, timeout_sec=5, detalhes=True),
+    }
+    assert outputs["list_devices"] == [{"name": "f5-selftest"}], outputs["list_devices"]
+    assert outputs["get_pool_status"]["pool"] == "/Common/pool_web_443", outputs["get_pool_status"]
+    for label, value in outputs.items():
+        _assert_clean(label, value)
+    # os avisos genéricos substituem o texto do TMOS
+    assert server.MSG_CONCURRENT in outputs["tcpdump_validate_traffic"]["avisos"]
+    # sem filtro, a tabela de conexões não é entregue
+    for call in (lambda: server.get_sys_connections("d"), lambda: server.get_pool_status("d")):
+        try:
+            call()
+            raise AssertionError("deveria exigir filtro/VS")
+        except safety.UnsafeInputError:
+            pass
+    print("OK: %d respostas sem comando/stderr/host/NTP/ARP/VLAN/autenticação" % len(outputs))
+
+    print("== segurança: erros chegam ao cliente como mensagem genérica ==")
+    errors = (
+        (F5ConnectionError("Falha ao conectar em d (192.0.2.1): Authentication failed, "
+                           "password=p@ss"), server.MSG_UNAVAILABLE),
+        (paramiko.AuthenticationException("Authentication failed."), server.MSG_UNAVAILABLE),
+        (paramiko.SSHException("Error reading SSH protocol banner"), server.MSG_UNAVAILABLE),
+        (OSError("[Errno 111] Connection refused 192.0.2.1:22"), server.MSG_UNAVAILABLE),
+        (InventoryError("Device d: variável de ambiente de usuário (F5_PROD01_USER) não "
+                        "definida. Verifique seu .env."), server.MSG_DEVICE),
+        (baseline_excel.BaselineError("Arquivo não encontrado: /app/data/x.xlsx"),
+         server.MSG_BASELINE),
+        (safety.CommandNotAllowedError("Comando tmsh fora da allowlist: tmsh show net vlan"),
+         server.MSG_NOT_ALLOWED),
+        (KeyError("/app/inventory.yaml"), server.MSG_INTERNAL),
+    )
+    for exc, expected in errors:
+        def boom(name, exc=exc):
+            raise exc
+        server._client_for = boom
+        try:
+            server.get_virtual_server_status("d")
+            raise AssertionError(f"deveria falhar: {exc!r}")
+        except RuntimeError as raised:
+            assert str(raised) == expected, (exc, str(raised))
+            _assert_clean("erro", str(raised))
+    print("OK: %d tipos de falha -> mensagem genérica, sem host/credencial/variável/caminho"
+          % len(errors))
+
+    print("== segurança: descrições e parâmetros das ferramentas (o que o modelo vê) ==")
+    import re
+    tools = asyncio.run(server.mcp.list_tools())
+    assert {t.name for t in tools} == {
+        "list_devices", "get_virtual_server_status", "get_virtual_server_config",
+        "get_pool_status", "get_sys_connections", "get_baseline_from_excel",
+        "get_baseline_from_sheets", "compare_vs_with_excel_baseline",
+        "compare_vs_with_sheets_baseline", "compare_pool_members_with_baseline",
+        "tcpdump_validate_traffic", "tcpdump_capture_connection"}, [t.name for t in tools]
+    banned = ("ssh", "tmsh", "perl", "paramiko", "bash", "advanced shell", "known_hosts",
+              "inventory", "senha", "password", "credencia", "sudo", "docker", "/app/",
+              "stderr", "pcap", "alarm", "processo", "autentic")
+    for tool in tools:
+        text = (tool.description or "") + json.dumps(tool.inputSchema, ensure_ascii=False)
+        for term in banned:
+            assert term not in text.lower(), f"{tool.name}: descrição cita {term!r}"
+        assert not re.search(FORBIDDEN_WORDS_RE, text, re.I), tool.name
+        props = set(tool.inputSchema.get("properties", {}))
+        assert not props & {"interface", "verbose", "command", "raw"}, (tool.name, props)
+    instructions = server.mcp.instructions or ""
+    for term in banned:
+        assert term not in instructions.lower(), f"instructions cita {term!r}"
+    print("OK: %d ferramentas sem termos de método/credencial; sem parâmetros interface/verbose"
+          % len(tools))
+
 def run():
     print("== tcpdump parser (flags + ISO 8583) ==")
     packets = tcpdump_parser.parse_tcpdump_output(SAMPLE_TCPDUMP)
@@ -250,7 +533,11 @@ def run():
     print("== tmsh parser (virtual servers) ==")
     vs_list = tmsh_parser.parse_virtual_servers(SAMPLE_LIST_VS)
     assert len(vs_list) == 2, vs_list
-    assert vs_list[0] == {"vs_name": "vs_web_443", "address": "10.1.1.10", "port": 443, "pool_name": "pool_web_443", "description": None}
+    first_vs = vs_list[0]
+    assert (first_vs["vs_name"], first_vs["address"], first_vs["port"], first_vs["pool_name"],
+            first_vs["description"]) == ("vs_web_443", "10.1.1.10", 443, "pool_web_443", None), first_vs
+    assert first_vs["ip_protocol"] == "tcp" and first_vs["enabled"] is True, first_vs
+    assert first_vs["profiles"] == ["tcp"] and first_vs["snat"] is None, first_vs
     print("OK:", vs_list)
 
     print("== tmsh parser (pool members) ==")
@@ -427,20 +714,19 @@ def run():
         limits=SimpleNamespace(tcpdump_max_count=500, tcpdump_max_duration_sec=60))
     server._client_for = lambda device: FakeClient(1, "bash: syntax error near unexpected token `('")
     failed = server.tcpdump_validate_traffic("f5-selftest", node_port=15000)
-    assert failed["status"] == "error" and failed["exit_status"] == 1, failed
-    assert "syntax error" in failed["message"], failed
+    assert failed["status"] == "error" and failed["message"] == server.MSG_CAPTURE_FAILED, failed
+    # o detalhe técnico (stderr/comando/código) NÃO chega ao cliente
+    assert set(failed) == {"status", "message"}, failed
+    assert "syntax error" not in json.dumps(failed), failed
     for good in (0, 124):  # 124 = prazo duro, esperado com pouco tráfego
         server._client_for = lambda device, code=good: FakeClient(code)
         assert server.tcpdump_validate_traffic("f5-selftest", node_port=15000)["status"] == "ok"
-    print("OK: exit 1 -> status error com stderr; 0 e 124 -> ok")
+    print("OK: exit 1 -> status error genérico (sem stderr/comando); 0 e 124 -> ok")
 
     print("== server: captura só por porta avisa que é abrangente ==")
     server._client_for = lambda device: FakeClient(0)
     broad = server.tcpdump_validate_traffic("f5-selftest", server_port=17000, node_port=15000)
     assert any("Captura abrangente" in w for w in broad["avisos"]), broad["avisos"]
-    broad_full = server.tcpdump_validate_traffic(
-        "f5-selftest", server_port=17000, node_port=15000, verbose=True)
-    assert any("Captura abrangente" in w for w in broad_full["warnings"]), broad_full["warnings"]
     narrow = server.tcpdump_validate_traffic(
         "f5-selftest", server_port=17000, vs_addr="10.100.1.10",
         node_port=15000, node_addr="192.168.0.9")
@@ -477,11 +763,34 @@ def run():
         "tipo": "Echo Test", "origem": "192.168.0.9", "respondida": True}], simple["transacoes"]
     assert simple["trafego"]["pacotes"] == 4 and simple["trafego"]["syn_ack"] == 1, simple["trafego"]
     assert simple["janela"] == {"max_s": 20, "encerrou_por": "prazo"}, simple["janela"]
-    assert any("1 sonda(s)" in a for a in simple["avisos"]), simple["avisos"]
-    full = server.tcpdump_validate_traffic("f5-selftest", **scope, verbose=True)
-    assert full["summary"]["total_packets"] == 7 and len(full["packets"]) == 7, full["summary"]
-    assert "command" in full and "stderr" in full
-    print("OK: 4 pacotes da VS + 1 transação por STAN; sonda ignorada (avisada); verbose volta tudo")
+    assert simple["avisos"] == [], simple["avisos"]   # sondas do monitor: fora e sem citar
+    print("OK: 4 pacotes da VS + 1 transação por STAN; sonda ignorada (avisada)")
+
+    print("== server: membro do pool sem SYN+ACK é informado (análise por membro) ==")
+    down_text = (
+        _entry("14:20:00.000000", "10.100.1.20", 4001, "10.100.2.1", 16000, "S", TCP_SYN)
+        + _entry("14:20:00.500000", "10.100.1.20", 4001, "10.100.2.1", 16000, "R.", TCP_RST_ACK)
+        + _entry("14:20:05.000000", "10.100.1.20", 4002, "10.100.2.1", 16000, "S", TCP_SYN)
+        + _entry("14:20:05.500000", "10.100.1.20", 4002, "10.100.2.1", 16000, "R.", TCP_RST_ACK)
+    )
+
+    class DownClient:
+        def tcpdump_capture(self, **kwargs):
+            return CommandResult(command="x", stdout=down_text, stderr="", exit_status=124)
+
+    server._client_for = lambda device: DownClient()
+    down = server.tcpdump_validate_traffic(
+        "f5-selftest", server_port=16000, vs_addr="10.100.1.10", node_port=16000,
+        node_addr="10.100.2.1")
+    assert down["status"] == "ok", down
+    assert down["membros"] == [{"membro": "10.100.2.1:16000",
+                                "situacao": "não responde ao SYN (sem SYN-ACK)",
+                                "syn": 2, "syn_ack": 0, "rst": 0}], down["membros"]
+    assert "10.100.2.1:16000 não responde ao SYN" in down["resultado"], down["resultado"]
+    assert down["trafego"]["pacotes"] == 0 and down["avisos"] == [], down
+    assert "sonda" not in json.dumps(down) and "monitor" not in json.dumps(down)
+    print("OK: \"Membro 10.100.2.1:16000 não responde ao SYN (2 SYN, 0 SYN-ACK)\" sem listar sondas")
+    server._client_for = lambda device: TextClient()   # volta ao cenario com transacoes
 
     print("== server: detalhes=True devolve a tabela no padrão pedido ==")
     detailed_view = server.tcpdump_validate_traffic("f5-selftest", **scope, detalhes=True)
@@ -566,24 +875,59 @@ def run():
     assert sent["node_port"] is None and sent["node_addr"] is None and sent["host"] is None, sent
     assert out["conexao"]["membros"] == ["192.168.0.9:15000"], out["conexao"]
     assert out["conexao"]["vs_ip_porta"] == "10.100.1.10:17000", out["conexao"]
-    shared_note = [w for w in out["avisos"] if "compartilhado" in w]
-    assert len(shared_note) == 1 and "vs_app1_15000" not in shared_note[0] and \
-        "pool_app1_15000" not in shared_note[0], shared_note  # sem nomear outra VS/pool
+    # nada sobre outras VS/pools (nem que o member e compartilhado)
+    assert not any("compartilhado" in w or "app1" in w for w in out["avisos"]), out["avisos"]
     for noisy in ("command", "packets", "stderr", "summary", "connection", "warnings"):
         assert noisy not in out, noisy
-    detailed = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho",
-                                                 client_addr="192.168.170.1", verbose=True)
-    assert detailed["connection"]["pool_members"] == ["192.168.0.9:15000"], detailed
-    assert any("vs_app1_15000" in w and "compartilhado" in w for w in detailed["warnings"]), detailed
-    assert "command" in detailed and "summary" in detailed
     # o filtro que o F5Client real monta para esses parâmetros
     client._run = fake_run
     client.tcpdump_capture(**capture_kwargs, server_port=17000, node_port=None,
                            vs_addr="10.100.1.10", node_members=[("192.168.0.9", 15000)])
     assert shlex.split(ssh_calls[-1])[-1] == (
         "((port 17000 and host 10.100.1.10) or (port 15000 and host 192.168.0.9))"), ssh_calls[-1]
+    # not_found: nao lista as demais VS; ambiguous: so as que casam com o pedido
+    nf = server.tcpdump_capture_connection("f5-selftest", "padaria do joaozinho")
+    assert nf["status"] == "not_found" and "available_connections" not in nf, nf
+    for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
+        assert other not in json.dumps(nf), other
+    amb = server.tcpdump_capture_connection("f5-selftest", "app")
+    assert all(set(c) == {"vs_name", "description"} for c in amb["candidates"]), amb
     print("OK: 'app' -> ambiguous, sem captura; padaria -> só VS 10.100.1.10:17000 + member "
-          "192.168.0.9:15000; aviso de member compartilhado com vs_app1_15000")
+          "192.168.0.9:15000, sem nenhuma menção a outras VS")
+
+    print("== server: captura de uma VS não traz transações de outra VS (mesmo node/STAN) ==")
+    other_vs_text = (
+        _entry("14:10:00.001000", "192.168.0.9", 50000, "10.100.1.10", 17000, "P.", TCP_PSH_ACK,
+               _iso_payload("0800", "301", bit11="000001"))
+        + _entry("14:10:00.001500", "10.100.1.20", 50000, "192.168.0.9", 15000, "P.", TCP_PSH_ACK,
+                 _iso_payload("0800", "301", bit11="000001"))
+        + _entry("14:10:00.030000", "192.168.0.9", 15000, "10.100.1.20", 50000, "P.", TCP_PSH_ACK,
+                 _iso_payload("0810", "301", bit11="000001"))
+        + _entry("14:10:00.030500", "10.100.1.10", 17000, "192.168.0.9", 50000, "P.", TCP_PSH_ACK,
+                 _iso_payload("0810", "301", bit11="000001"))
+        # outra VS (:15000) no MESMO node, MESMO STAN, 30 s depois, outra porta efemera
+        + _entry("14:10:30.000000", "10.100.1.20", 49991, "192.168.0.9", 15000, "P.", TCP_PSH_ACK,
+                 _iso_payload("0800", "301", bit11="000001"))
+        + _entry("14:10:30.030000", "192.168.0.9", 15000, "10.100.1.20", 49991, "P.", TCP_PSH_ACK,
+                 _iso_payload("0810", "301", bit11="000001"))
+        # sonda do monitor
+        + _entry("14:10:31.000000", "10.100.1.20", 4321, "192.168.0.9", 15000, "S", TCP_SYN)
+    )
+
+    class OtherVsClient(ConnClient):
+        def tcpdump_capture(self, **kwargs):
+            return CommandResult(command="x", stdout=other_vs_text, stderr="", exit_status=124)
+
+    server._client_for = lambda device: OtherVsClient()
+    mine = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho", detalhes=True)
+    assert mine["status"] == "ok", mine
+    assert len(mine["transacoes"]) == 1 and mine["transacoes"][0]["saltos"] == 4, mine["transacoes"]
+    assert mine["trafego"]["pacotes"] == 4 and mine["avisos"] == [], mine
+    for citing in ("49991", "4321", "app1", "outra VS", "sonda"):
+        assert citing not in json.dumps(mine, ensure_ascii=False), citing
+    print("OK: 1 transação / 4 saltos; perna da outra VS (mesmo STAN, 30 s depois) e sonda fora")
+
+    _security_checks(device, client)
 
     print("\nTODOS OS AUTO-TESTES PASSARAM")
 

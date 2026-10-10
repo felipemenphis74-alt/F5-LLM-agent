@@ -408,6 +408,9 @@ def summarize(packets: list[dict]) -> dict:
 # confere a paridade das duas. Altere os dois juntos.
 
 MAX_TRANSACTIONS = 50
+# Janela (s) em que uma perna do node precisa começar/passar depois da mensagem/conexão
+# da VS para ser atribuída a ela. O F5 repassa em milissegundos; 2 s cobre carga alta.
+ATTRIBUTION_WINDOW_S = 2.0
 # Fluxo do monitor do pool (tcp_half_open): só SYN / SYN-ACK / RST, sem handshake
 # completo, sem dados.
 _PROBE_LABELS = frozenset(("SYN", "SYN-ACK", "RST", "RST-ACK"))
@@ -441,7 +444,7 @@ def focus_vs_traffic(
     que divide o IP da VS ou o node (ex: VS :15000 no mesmo IP, pool com o mesmo
     member) e é descartado. Devolve (pacotes mantidos, info)."""
     info = {"separated": False, "probe_flows": 0, "probe_packets": 0,
-            "other_flows": 0, "other_packets": 0}
+            "other_flows": 0, "other_packets": 0, "probe_pkts": []}
     if server_port is not None and vs_addr is not None:
         vs_endpoint = f"{vs_addr}.{server_port}"
 
@@ -458,14 +461,38 @@ def focus_vs_traffic(
     for pkt in packets:
         flows.setdefault(_flow_key(pkt), []).append(pkt)
 
+    # Quando cada conexão da VS começou (por porta efêmera do cliente) e quando cada
+    # mensagem (STAN + MTI) passou pelo lado da VS: a perna do node só é "desta VS" se
+    # bater COM proximidade de tempo — STAN repetido entre VS (comum: contador por
+    # terminal) não pode puxar a conexão de outra VS para esta resposta.
     vs_flows = set()
-    vs_stans = set()
-    client_ports = set()
+    vs_start_by_port: dict[int | None, list[float | None]] = {}
+    vs_time_by_msg: dict[tuple, list[float | None]] = {}
     for key, pkts in flows.items():
         if any(is_vs_endpoint(e) for e in key):
             vs_flows.add(key)
-            vs_stans.update(p["bit11"] for p in pkts if p.get("mti") and p.get("bit11"))
-            client_ports.update(_endpoint_parts(e)[1] for e in key if not is_vs_endpoint(e))
+            first = _seconds(pkts[0]["time"])
+            for e in key:
+                if not is_vs_endpoint(e):
+                    vs_start_by_port.setdefault(_endpoint_parts(e)[1], []).append(first)
+            for p in pkts:
+                if p.get("mti") and p.get("bit11"):
+                    vs_time_by_msg.setdefault((p["bit11"], p["mti"]), []).append(
+                        _seconds(p["time"]))
+
+    def near(moment: float | None, times: list) -> bool:
+        return any(moment is None or t is None or abs(moment - t) <= ATTRIBUTION_WINDOW_S
+                   for t in times)
+
+    def belongs_to_vs(pkts: list[dict], key: tuple) -> bool:
+        for p in pkts:
+            if p.get("mti") and p.get("bit11"):
+                times = vs_time_by_msg.get((p["bit11"], p["mti"]))
+                if times and near(_seconds(p["time"]), times):
+                    return True
+        started = _seconds(pkts[0]["time"])
+        return any(near(started, vs_start_by_port[port])
+                   for port in (_endpoint_parts(e)[1] for e in key) if port in vs_start_by_port)
 
     keep = set(vs_flows)
     for key, pkts in flows.items():
@@ -476,13 +503,53 @@ def focus_vs_traffic(
         if probe:
             info["probe_flows"] += 1
             info["probe_packets"] += len(pkts)
-        elif (any(p.get("bit11") in vs_stans for p in pkts if p.get("mti") and p.get("bit11"))
-              or any(_endpoint_parts(e)[1] in client_ports for e in key)):
+            info["probe_pkts"].extend(pkts)
+        elif belongs_to_vs(pkts, key):
             keep.add(key)
         else:
             info["other_flows"] += 1
             info["other_packets"] += len(pkts)
     return [p for p in packets if _flow_key(p) in keep], info
+
+
+def member_health(packets: list[dict], members: list[tuple[str | None, int]]) -> list[dict]:
+    """Como cada membro do pool da VS respondeu às aberturas de conexão vistas na
+    captura (sondas do monitor do pool + conexões da própria VS):
+      - SYN-ACK vindo do membro  -> "responde ao SYN"
+      - RST vindo do membro      -> "recusa a conexão (RST)"
+      - só SYN, sem resposta     -> "não responde ao SYN (sem SYN-ACK)"
+      - nada                     -> "sem tentativas de abertura na janela"
+    `members` = [(ip | None, porta)]; com ip None casa só pela porta. Só os membros da VS
+    pedida entram — nada sobre outras VS."""
+    out = []
+    for addr, port in members:
+        wanted = f"{addr}.{port}" if addr else None
+
+        def is_member(endpoint: str) -> bool:
+            if wanted is not None:
+                return endpoint == wanted
+            return _endpoint_parts(endpoint)[1] == port
+
+        syn = syn_ack = rst = 0
+        for pkt in packets:
+            label = pkt["flags_label"]
+            if label == "SYN" and is_member(pkt["dst"]):
+                syn += 1
+            elif label == "SYN-ACK" and is_member(pkt["src"]):
+                syn_ack += 1
+            elif label in ("RST", "RST-ACK") and is_member(pkt["src"]):
+                rst += 1
+        if syn_ack:
+            situation = "responde ao SYN"
+        elif rst:
+            situation = "recusa a conexão (RST)"
+        elif syn:
+            situation = "não responde ao SYN (sem SYN-ACK)"
+        else:
+            situation = "sem tentativas de abertura na janela"
+        out.append({"membro": f"{addr}:{port}" if addr else f"porta {port}",
+                    "situacao": situation, "syn": syn, "syn_ack": syn_ack, "rst": rst})
+    return out
 
 
 def _is_response_mti(mti: str) -> bool:
@@ -559,7 +626,8 @@ def build_transactions(packets: list[dict], detail: bool = False) -> list[dict]:
     return out
 
 
-def render_details_markdown(transactions: list[dict], vs_label: str) -> str:
+def render_details_markdown(transactions: list[dict], vs_label: str,
+                            members: list[dict] | None = None) -> str:
     """Tabela no padrão pedido pelo usuário (# | Tipo | STAN | Enviada | Resposta | RTT |
     Rastreio) + observações — pronta para ser apresentada como está."""
     total = len(transactions)
@@ -588,12 +656,32 @@ def render_details_markdown(transactions: list[dict], vs_label: str) -> str:
     complete = sum(1 for t in transactions if t["saltos"] >= EXPECTED_HOPS)
     lines.append(f"- **Rastreio:** {complete} de {total} com os {EXPECTED_HOPS} saltos "
                  "(cliente→VS, F5→node, node→F5, VS→cliente)")
+    if members:
+        lines.append("- **Membros do pool:** " + "; ".join(
+            f"{m['membro']} {m['situacao']}" for m in members))
     return "\n".join(lines)
 
 
-def _verdict(kept: list[dict], summary: dict, transactions: list[dict], flows: int) -> str:
+def _members_sentence(members: list[dict] | None, with_ok: bool) -> str:
+    """Frase sobre a saúde dos membros do pool da VS (só os que falham; com `with_ok`,
+    também "responderam" quando todos respondem)."""
+    if not members:
+        return ""
+    failing = [m for m in members
+               if m["situacao"].startswith(("não responde", "recusa"))]
+    if failing:
+        return " " + " ".join(
+            f"Membro {m['membro']} {m['situacao']} "
+            f"({m['syn']} SYN, {m['syn_ack']} SYN-ACK)." for m in failing)
+    if with_ok and any(m["syn"] or m["syn_ack"] for m in members):
+        return " Os membros do pool responderam ao SYN."
+    return ""
+
+
+def _verdict(kept: list[dict], summary: dict, transactions: list[dict], flows: int,
+             members: list[dict] | None = None) -> str:
     if not kept:
-        return "Nenhum tráfego da VS na janela capturada."
+        return "Nenhum tráfego da VS na janela capturada." + _members_sentence(members, True)
     if transactions:
         answered = sum(1 for t in transactions if t["respondida"])
         kinds: dict[str, int] = {}
@@ -602,12 +690,13 @@ def _verdict(kept: list[dict], summary: dict, transactions: list[dict], flows: i
             kinds[label] = kinds.get(label, 0) + 1
         mix = ", ".join(f"{n}×{mti}" for mti, n in sorted(kinds.items()))
         return (f"{len(transactions)} transação(ões) ISO 8583 na VS ({mix}): "
-                f"{answered} respondida(s), {len(transactions) - answered} sem resposta.")
+                f"{answered} respondida(s), {len(transactions) - answered} sem resposta."
+                + _members_sentence(members, False))
     text = (f"Tráfego da VS observado ({len(kept)} pacotes em {flows} conexão(ões)), "
             "sem mensagens ISO 8583 reconhecidas.")
     if summary["syn"] and not summary["syn_ack"]:
         text += " Houve SYN sem nenhum SYN-ACK: o destino não respondeu à abertura."
-    return text
+    return text + _members_sentence(members, False)
 
 
 def simplified_view(
@@ -617,19 +706,23 @@ def simplified_view(
     vs_addr: str | None = None,
     detalhes: bool = False,
     stan: str | None = None,
+    members: list[tuple[str | None, int]] | None = None,
 ) -> tuple[dict, list[str]]:
     """Resposta enxuta para o usuário: veredito, contagens e transações — só do tráfego
     da VS pedida. Com `detalhes`, cada transação traz campos ISO, trajeto e RTT e a
     visão inclui `tabela_markdown`; `stan` restringe às transações com esse STAN.
-    Devolve (visão, avisos sobre o foco aplicado)."""
+    Com `members` (IP/porta dos membros do pool da VS), `membros` resume como cada um
+    respondeu ao SYN — a análise de "node fora do ar" — usando as sondas do monitor e as
+    conexões da VS; as sondas em si não são listadas. Devolve (visão, avisos)."""
     kept, info = focus_vs_traffic(packets, server_port, node_port, vs_addr)
+    health = member_health(kept + info["probe_pkts"], members) if members else None
     summary = summarize(kept)
     flows = {_flow_key(p) for p in kept}
     transactions = build_transactions(kept, detail=detalhes)
     if stan is not None:
         transactions = [t for t in transactions if t["stan"] == stan]
     view = {
-        "resultado": _verdict(kept, summary, transactions, len(flows)),
+        "resultado": _verdict(kept, summary, transactions, len(flows), health),
         "trafego": {
             "conexoes": len(flows),
             "pacotes": len(kept),
@@ -641,6 +734,8 @@ def simplified_view(
         },
         "transacoes": transactions[:MAX_TRANSACTIONS],
     }
+    if health is not None:
+        view["membros"] = health
     if len(transactions) > MAX_TRANSACTIONS:
         view["transacoes_omitidas"] = len(transactions) - MAX_TRANSACTIONS
     if stan is not None and not transactions:
@@ -652,17 +747,11 @@ def simplified_view(
             label = f"VS, porta {server_port}"
         else:
             label = "VS"
-        view["tabela_markdown"] = render_details_markdown(view["transacoes"], label)
+        view["tabela_markdown"] = render_details_markdown(view["transacoes"], label, health)
 
+    # O que foi descartado (sondas do monitor, conexões que não são da VS pedida) NÃO é
+    # reportado: a resposta traz só a VS pedida, sem contexto de outras conexões.
     notes = []
-    if info["probe_flows"]:
-        notes.append(
-            f"{info['probe_flows']} sonda(s) do monitor do pool "
-            f"({info['probe_packets']} pacotes) foram ignoradas: não são tráfego da VS.")
-    if info["other_flows"]:
-        notes.append(
-            f"{info['other_flows']} conexão(ões) de outra(s) VS que dividem o IP da VS ou o "
-            f"node ({info['other_packets']} pacotes) foram ignoradas: não são da VS pedida.")
     if not info["separated"] and kept:
         notes.append(
             "Não foi possível separar o tráfego da VS do restante (informe vs_addr junto "

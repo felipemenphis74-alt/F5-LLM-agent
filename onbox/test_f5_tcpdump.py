@@ -81,10 +81,16 @@ def sll2(ip, proto=0x0800):
     return struct.pack("!HHIHBB8s", proto, 0, 1, 1, 0, 6, b"\x00" * 8) + ip
 
 
-def pcap(frames, linktype=1, endian="<", magic=0xA1B2C3D4):
+def pcap(frames, linktype=1, endian="<", magic=0xA1B2C3D4, stamps=None):
+    """`stamps`: instante de cada quadro (s, float); padrao = 1 s entre quadros."""
     out = struct.pack(endian + "IHHiIII", magic, 2, 4, 0, 0, 65535, linktype)
     for index, frame in enumerate(frames):
-        out += struct.pack(endian + "IIII", 1700000000 + index, 123456, len(frame), len(frame))
+        if stamps is None:
+            sec, usec = 1700000000 + index, 123456
+        else:
+            sec = int(stamps[index])
+            usec = int(round((stamps[index] - sec) * 1000000))
+        out += struct.pack(endian + "IIII", sec, usec, len(frame), len(frame))
         out += frame
     return out
 
@@ -105,14 +111,23 @@ def fresh_dir():
 
 def test_validation():
     print("== validacao / safety ==")
-    ok = ft.validate_request({"interface": "any", "server_port": 443, "node_port": "15000",
+    ok = ft.validate_request({"server_port": 443, "node_port": "15000",
                               "host": "10.100.2.1", "count": 50, "timeout_sec": 10})
     assert ok == {"interface": "any", "server_port": 443, "node_port": 15000,
                   "host": "10.100.2.1", "count": 50, "timeout_sec": 10,
                   "vs_addr": None, "client_addr": None, "node_addr": None,
-                  "verbose": False, "detalhes": False, "stan": None}, ok
-    assert ft.validate_request({"vs_addr": "10.100.1.10", "verbose": True})["vs_addr"] == \
+                  "detalhes": False, "stan": None}, ok
+    assert ft.validate_request({"vs_addr": "10.100.1.10", "detalhes": True})["vs_addr"] == \
         "10.100.1.10"
+    # a interface de captura e fixa e interna: o cliente nao a escolhe (nem ve)
+    assert ok["interface"] == ft.CAPTURE_INTERFACE == "any"
+    for forbidden in ({"interface": "any"}, {"interface": "0.0"}, {"verbose": True},
+                      {"verbose": False}):
+        try:
+            ft.validate_request(forbidden)
+            raise AssertionError("parametro removido deveria ser recusado: %r" % forbidden)
+        except ft.RequestError as exc:
+            assert exc.status == "invalid", exc.status
     assert ft.validate_request({"host": "2001:db8::1"})["host"] == "2001:db8::1"
     defaults = ft.validate_request({})
     assert defaults["count"] == ft.DEFAULT_COUNT and defaults["interface"] == "any"
@@ -401,18 +416,20 @@ def test_run_end_to_end():
     set_scenario(work, pcap=pcap_path, record=record,
                  stderr="tcpdump: listening on any\n3 packets captured\n")
     t0 = time.time()
-    result = ft.run({"node_port": 15000, "host": b, "count": 10, "timeout_sec": 5,
-                     "verbose": True}, **common)
+    result = ft.run({"node_port": 15000, "host": b, "count": 10, "timeout_sec": 5}, **common)
     assert result["status"] == "ok", result
-    assert result["exit_status"] == 0 and result["timed_out"] is False, result
-    assert result["summary"]["syn"] == 1 and result["summary"]["rst_ack"] == 1, result["summary"]
-    assert result["summary"]["syn_ack"] == 0 and result["summary"]["echo_tests"] == 1
-    assert len(result["packets"]) == 3 and result["warnings"] == [], result
+    assert result["janela"] == {"max_s": 5, "encerrou_por": "limite de pacotes"}, result
+    assert result["trafego"]["pacotes"] == 3 and result["trafego"]["syn"] == 1, result
+    assert result["trafego"]["rst"] == 1 and result["trafego"]["mensagens_iso"] == 1, result
+    assert result["avisos"] == [] or all("Não foi possível separar" in a
+                                         for a in result["avisos"]), result
+    for hidden in ("command", "exit_status", "timed_out", "stderr", "summary", "packets",
+                   "warnings"):
+        assert hidden not in result, "nao pode expor %r" % hidden
     with open(record) as handle:
         argv = json.load(handle)
     assert argv[1:] == ["-nn", "-U", "-s", "512", "-c", "10", "-i", "any", "-w", "-", "--",
                         "port", "15000", "and", "host", b], argv
-    assert result["command"].endswith("port 15000 and host " + b), result["command"]
     assert time.time() - t0 < 5
 
     # 2) 1222 pedida -> bloqueada e o tcpdump NUNCA e executado
@@ -424,27 +441,24 @@ def test_run_end_to_end():
     # 3) estouro de prazo -> exit 124, pacotes ja emitidos continuam aproveitados
     set_scenario(work, pcap=pcap_path, sleep=30)
     t0 = time.time()
-    slow = ft.run({"node_port": 15000, "timeout_sec": 1, "verbose": True}, **common)
+    slow = ft.run({"node_port": 15000, "timeout_sec": 1}, **common)
     elapsed = time.time() - t0
-    assert slow["status"] == "ok" and slow["exit_status"] == 124 and slow["timed_out"], slow
-    assert len(slow["packets"]) == 3 and elapsed < 8, (len(slow["packets"]), elapsed)
+    assert slow["status"] == "ok" and slow["janela"]["encerrou_por"] == "prazo", slow
+    assert slow["trafego"]["pacotes"] == 3 and elapsed < 8, (slow["trafego"], elapsed)
 
     # 4) aviso do TMOS no stderr vira warning explicito
     set_scenario(work, pcap=pcap_path,
                  stderr="WARNING - The recommended number of tmm tcpdump instances (2) "
                         "has been exceeded (2).\n")
-    warned = ft.run({"node_port": 15000, "verbose": True}, **common)
-    assert warned["status"] == "ok" and len(warned["warnings"]) == 1, warned
-    assert "tmm tcpdump instances" in warned["warnings"][0]
-    simple_warned = ft.run({"node_port": 15000}, **common)
-    assert len(simple_warned["avisos"]) >= 1 and \
-        "tmm tcpdump instances" in simple_warned["avisos"][0], simple_warned
+    warned = ft.run({"node_port": 15000}, **common)
+    assert warned["status"] == "ok" and ft.MSG_CONCURRENT in warned["avisos"], warned
+    assert "tmm" not in json.dumps(warned) and "tcpdump" not in json.dumps(warned), warned
 
     # 4b) falha do proprio tcpdump (interface inexistente, filtro...) -> error, nunca "ok"
     set_scenario(work, stderr="tcpdump: bogus0: No such device exists\n", exit=1)
     broken = ft.run({"node_port": 15000}, **common)
-    assert broken["status"] == "error" and broken["exit_status"] == 1, broken
-    assert "No such device" in broken["message"], broken
+    assert broken == {"status": "error", "message": ft.MSG_CAPTURE_FAILED}, broken
+    assert "bogus0" not in json.dumps(broken) and "No such device" not in json.dumps(broken)
 
     # 5) concorrencia: 1 rodando -> ok; 2 rodando -> busy, sem executar
     set_scenario(work, pcap=pcap_path, record=record)
@@ -456,8 +470,9 @@ def test_run_end_to_end():
     two_running = fake_proc_dir(fresh_dir(), ["tcpdump", "tcpdump", "sshd"])
     assert ft.count_running_tcpdump(two_running) == 2
     busy = ft.run({"node_port": 15000}, **dict(common, proc_dir=two_running))
-    assert busy["status"] == "busy" and busy["retry_after_minutes"] == 5, busy
-    assert "5 minutos" in busy["message"] and "tcpdump" in busy["message"], busy["message"]
+    assert busy == {"status": "busy", "message": ft.MSG_BUSY, "retry_after_minutes": 5}, busy
+    assert "5 minutos" in busy["message"] and "tcpdump" not in busy["message"], busy["message"]
+    assert socket.gethostname() not in busy["message"], busy["message"]
     assert not os.path.exists(record), "nada pode ser iniciado quando esta no teto"
 
     # 6) guarda atomica ocupada por outra chamada -> busy, sem esperar para sempre
@@ -476,8 +491,10 @@ def test_run_end_to_end():
     # 7) tcpdump ausente -> erro claro (sem excecao)
     missing = ft.run({"node_port": 15000}, tcpdump_bin=os.path.join(work, "nao_existe"),
                      lock_dir=lock_dir, proc_dir=proc, audit=False)
-    assert missing["status"] == "error", missing
-    print("OK: feliz / 1222 / timeout 124 / warning TMM / teto / guarda / binario ausente")
+    assert missing == {"status": "error", "message": ft.MSG_UNAVAILABLE}, missing
+    assert "/usr/sbin" not in json.dumps(missing), missing
+    print("OK: feliz / 1222 / timeout 124 / warning TMM / teto / guarda / binario ausente "
+          "(todos sem comando/stderr/caminhos)")
 
 
 def _vs_scenario_frames():
@@ -546,8 +563,13 @@ def test_simplified_output():
     assert simple["status"] == "ok", simple
     for noisy in ("command", "packets", "stderr", "summary", "exit_status", "timed_out"):
         assert noisy not in simple, "resposta simples nao deve trazer %r" % noisy
-    assert sorted(simple) == ["avisos", "janela", "resultado", "status", "trafego",
-                              "transacoes"], sorted(simple)
+    assert sorted(simple) == ["avisos", "janela", "membros", "resultado", "status",
+                              "trafego", "transacoes"], sorted(simple)
+    # o membro do pool respondeu ao SYN (sondas do monitor + conexao da VS)
+    assert simple["membros"] == [{"membro": "192.168.0.9:15000", "situacao": "responde ao SYN",
+                                  "syn": simple["membros"][0]["syn"], "syn_ack": simple["membros"][0]["syn_ack"],
+                                  "rst": 0}], simple["membros"]
+    assert simple["membros"][0]["syn"] >= 4 and simple["membros"][0]["syn_ack"] >= 4
     tx = simple["transacoes"]
     assert [(t["stan"], t["pedido"], t["resposta"], t["respondida"]) for t in tx] == [
         ("111111", "0800", "0810", True), ("222222", "0100", "0110", True)], tx
@@ -555,17 +577,13 @@ def test_simplified_output():
     assert tx[1]["tipo"] == "Pedido de autorização", tx[1]
     assert simple["resultado"] == ("2 transação(ões) ISO 8583 na VS (1×0100, 1×0800): "
                                    "2 respondida(s), 0 sem resposta."), simple["resultado"]
-    # 3 sondas (9 pacotes) ignoradas; 1 conexao da VS em 2 pernas = 2 fluxos, 14 pacotes
+    # sondas (9 pacotes) fora; 1 conexao da VS em 2 pernas = 2 fluxos, 14 pacotes
     assert simple["trafego"]["conexoes"] == 2 and simple["trafego"]["pacotes"] == 14, simple["trafego"]
     assert simple["trafego"]["syn"] == 2 and simple["trafego"]["syn_ack"] == 2, simple["trafego"]
     assert simple["trafego"]["rst"] == 0 and simple["trafego"]["mensagens_iso"] == 8
     assert simple["janela"] == {"max_s": 5, "encerrou_por": "limite de pacotes"}, simple["janela"]
-    assert len(simple["avisos"]) == 1 and "3 sonda(s)" in simple["avisos"][0], simple["avisos"]
-
-    # verbose = retorno completo (inclui as sondas, comando e pacotes brutos)
-    full = ft.run(dict(request, verbose=True), **common)
-    assert full["summary"]["total_packets"] == 23 and len(full["packets"]) == 23, full["summary"]
-    assert "command" in full and "stderr" in full
+    # o que foi descartado NAO e reportado (nem sondas, nem outras VS)
+    assert simple["avisos"] == [], simple["avisos"]
 
     # sem como separar a VS (so a porta do node): nada e descartado, e avisa
     broad = ft.run({"node_port": 15000, "host": "192.168.0.9"}, **common)
@@ -628,8 +646,7 @@ def test_simplified_output():
         view, notes = ft.simplified_view(mixed, *args)
         assert [t["stan"] for t in view["transacoes"]] == ["111111", "222222"], (args, view)
         assert view["trafego"]["pacotes"] == 14 and view["trafego"]["conexoes"] == 2, view
-        assert any("2 conexão(ões) de outra(s) VS" in n and "(4 pacotes)" in n
-                   for n in notes), notes
+        assert notes == [], notes      # sem mencionar a outra VS
     # a outra VS, pedida pelo seu proprio IP:porta, sai sozinha
     other = ft.simplified_view(mixed, 15000, 15000, "10.100.1.10")[0]
     assert [t["stan"] for t in other["transacoes"]] == ["333333"], other
@@ -638,8 +655,162 @@ def test_simplified_output():
     probes_only = [f for f in _vs_scenario_frames()[-9:]]
     empty = ft.simplified_view(ft.parse_pcap(pcap(probes_only)), 17000, 15000, "10.100.1.10")
     assert empty[0]["resultado"] == "Nenhum tráfego da VS na janela capturada.", empty
-    assert empty[0]["trafego"]["pacotes"] == 0 and "3 sonda(s)" in empty[1][0], empty
-    print("OK: sem command/packets/stderr; 2 transacoes por STAN; 3 sondas fora; verbose volta tudo")
+    assert empty[0]["trafego"]["pacotes"] == 0 and empty[1] == [], empty
+    print("OK: sem command/packets/stderr; 2 transacoes por STAN; sondas e outras VS fora, "
+          "sem citar nenhuma")
+
+
+def _two_vs_same_stan_frames(gap):
+    """Captura da app1 (10.100.1.10:15000) com a conexao dela E a perna de node de OUTRA VS
+    (10.100.1.10:17000) que usa o MESMO node e o MESMO STAN, `gap` s depois."""
+    client, vs, snat, node = "192.168.0.9", "10.100.1.10", "10.100.1.20", "192.168.0.9"
+    frames, stamps = [], []
+
+    def add(at, src, dst, sport, dport, flags, payload):
+        frames.append(eth(ipv4_packet(src, dst, tcp_segment(sport, dport, flags, payload))))
+        stamps.append(1700000100.0 + at)
+
+    req, resp = iso_payload("0800", "301", bit11="000001"), iso_payload("0810", "301", bit11="000001")
+    # app1 (a VS pedida)
+    add(0.000, client, vs, 50200, 15000, TCP_PSH_ACK, req)
+    add(0.001, snat, node, 50200, 15000, TCP_PSH_ACK, req)
+    add(0.030, node, snat, 15000, 50200, TCP_PSH_ACK, resp)
+    add(0.031, vs, client, 15000, 50200, TCP_PSH_ACK, resp)
+    # outra VS, mesmo node, MESMO STAN (contador por terminal repete valores)
+    add(gap, snat, node, 50300, 15000, TCP_PSH_ACK, req)
+    add(gap + 0.030, node, snat, 15000, 50300, TCP_PSH_ACK, resp)
+    return frames, stamps
+
+
+def test_same_stan_other_vs_and_no_internal_details():
+    print("== STAN repetido em outra VS no mesmo node + nada interno nas respostas ==")
+    for gap, expected_packets, expected_tx in ((30.0, 4, 1), (5.0, 4, 1)):
+        frames, stamps = _two_vs_same_stan_frames(gap)
+        packets = ft.parse_pcap(pcap(frames, stamps=stamps))
+        view, notes = ft.simplified_view(packets, 15000, 15000, "10.100.1.10", detalhes=True)
+        assert view["trafego"]["pacotes"] == expected_packets, (gap, view["trafego"])
+        assert len(view["transacoes"]) == expected_tx, (gap, view["transacoes"])
+        assert view["transacoes"][0]["saltos"] == 4, (gap, view["transacoes"][0])
+        assert notes == [], notes
+        for citing in ("outra", "50300", "17000"):
+            assert citing not in json.dumps(view, ensure_ascii=False), (gap, citing)
+
+    # respostas de todos os caminhos (ok/busy/blocked/invalid/error/inesperado): sem nada
+    # que revele metodo, comando, caminho, host ou texto do equipamento
+    work = fresh_dir()
+    fake = make_fake(work)
+    proc = fake_proc_dir(work, ["bash"])
+    pcap_path = os.path.join(work, "cap.pcap")
+    with open(pcap_path, "wb") as handle:
+        handle.write(pcap(_vs_scenario_frames()))
+    common = dict(tcpdump_bin=fake, lock_dir=os.path.join(work, "locks"), proc_dir=proc,
+                  audit=False)
+    responses = []
+    set_scenario(work, pcap=pcap_path, stderr="WARNING - tmm tcpdump instances (2) exceeded\n")
+    responses.append(ft.run({"server_port": 17000, "node_port": 15000, "vs_addr": "10.100.1.10",
+                             "detalhes": True}, **common))
+    responses.append(ft.run({"server_port": 1222}, **common))
+    responses.append(ft.run({"host": "nao-e-ip"}, **common))
+    responses.append(ft.run({"interface": "eth0"}, **common))
+    responses.append(ft.run({"node_port": 15000},
+                            **dict(common, proc_dir=fake_proc_dir(fresh_dir(),
+                                                                  ["tcpdump", "tcpdump"]))))
+    set_scenario(work, stderr="tcpdump: /etc/shadow: Permission denied secret-token\n", exit=1)
+    responses.append(ft.run({"node_port": 15000}, **common))
+    responses.append(ft.run({"node_port": 15000}, tcpdump_bin="/nao/existe/tcpdump",
+                            lock_dir=common["lock_dir"], proc_dir=proc, audit=False))
+    original = ft._run
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("falha em /etc/shadow com token secret-token")
+
+    ft._run = explode
+    try:
+        responses.append(ft.run({"node_port": 15000}, **common))
+    finally:
+        ft._run = original
+
+    forbidden = ("tcpdump", "sudo", "restnoded", "stderr", "command", "exit_status", "/usr/",
+                 "/etc/", "/nao/", "perl", "bash", "traceback", "runtimeerror", "secret",
+                 "tmm", "subprocess", "popen", "flock", "/proc", "syslog",
+                 socket.gethostname().lower())
+    for response in responses:
+        text = json.dumps(response, ensure_ascii=False).lower()
+        for term in forbidden:
+            if term:
+                assert term not in text, "vazou %r em %s" % (term, text[:300])
+    # valores do cliente aparecem sem o prefixo u"..." do repr() do Python 2
+    for response in responses:
+        assert "u'" not in response["message"] if "message" in response else True, response
+    assert ft.run({"interface": "x"}, audit=False)["message"] == \
+        "Parâmetro(s) não suportado(s): \"interface\"", ft.run({"interface": "x"}, audit=False)
+    statuses = [r["status"] for r in responses]
+    assert statuses == ["ok", "blocked", "invalid", "invalid", "busy", "error", "error", "error"], \
+        statuses
+    assert responses[-1] == {"status": "error", "message": ft.MSG_INTERNAL}, responses[-1]
+    print("OK: STAN repetido noutra VS nao entra (janela de tempo); 8 respostas sem metodo/"
+          "comando/caminho/host")
+
+
+def _member_frames():
+    """Tres membros do pool: um que NAO responde ao SYN (so tentativas + RST do proprio
+    F5), um que responde (SYN-ACK) e um que RECUSA (RST vindo dele)."""
+    snat = "10.100.1.20"
+    frames = []
+
+    def add(src, dst, sport, dport, flags):
+        frames.append(eth(ipv4_packet(src, dst, tcp_segment(sport, dport, flags))))
+
+    for port in (4001, 4002, 4003):                       # 10.100.2.1: mudo
+        add(snat, "10.100.2.1", port, 15000, TCP_SYN)
+        add(snat, "10.100.2.1", port, 15000, TCP_RST_ACK)  # o F5 desiste (nao e do membro)
+    for port in (4101, 4102):                              # 192.168.0.9: responde
+        add(snat, "192.168.0.9", port, 15000, TCP_SYN)
+        add("192.168.0.9", snat, 15000, port, TCP_SYN_ACK)
+        add(snat, "192.168.0.9", port, 15000, 0x04)
+    add(snat, "10.100.3.1", 4201, 15000, TCP_SYN)          # 10.100.3.1: recusa
+    add("10.100.3.1", snat, 15000, 4201, TCP_RST_ACK)
+    return frames
+
+
+def test_member_health():
+    print("== analise por membro: node sem SYN+ACK continua sendo informado ==")
+    packets = ft.parse_pcap(pcap(_member_frames()))
+    health = ft.member_health(packets, [("10.100.2.1", 15000), ("192.168.0.9", 15000),
+                                        ("10.100.3.1", 15000), ("10.100.9.9", 15000)])
+    assert [(h["membro"], h["situacao"], h["syn"], h["syn_ack"], h["rst"]) for h in health] == [
+        ("10.100.2.1:15000", "não responde ao SYN (sem SYN-ACK)", 3, 0, 0),
+        ("192.168.0.9:15000", "responde ao SYN", 2, 2, 0),
+        ("10.100.3.1:15000", "recusa a conexão (RST)", 1, 0, 1),
+        ("10.100.9.9:15000", "sem tentativas de abertura na janela", 0, 0, 0)], health
+
+    # ponta a ponta: capturando o "pool" de uma VS sem nenhum trafego de cliente, o veredito
+    # diz QUAL membro nao responde - e nao lista as sondas nem cita outras VS
+    work = fresh_dir()
+    fake = make_fake(work)
+    proc = fake_proc_dir(work, ["bash"])
+    pcap_path = os.path.join(work, "cap.pcap")
+    with open(pcap_path, "wb") as handle:
+        handle.write(pcap(_member_frames()))
+    set_scenario(work, pcap=pcap_path)
+    common = dict(tcpdump_bin=fake, lock_dir=os.path.join(work, "locks"), proc_dir=proc,
+                  audit=False)
+    out = ft.run({"server_port": 16000, "node_port": 15000, "vs_addr": "10.100.1.10",
+                  "node_addr": "10.100.2.1"}, **common)
+    assert out["status"] == "ok", out
+    assert out["resultado"] == ("Nenhum tráfego da VS na janela capturada. Membro "
+                                "10.100.2.1:15000 não responde ao SYN (sem SYN-ACK) "
+                                "(3 SYN, 0 SYN-ACK)."), out["resultado"]
+    assert out["membros"][0]["situacao"].startswith("não responde"), out["membros"]
+    assert out["trafego"]["pacotes"] == 0 and out["avisos"] == [], out
+    for citing in ("sonda", "monitor", "outra", "10.100.1.20"):
+        assert citing not in json.dumps(out, ensure_ascii=False), citing
+    # membro que responde -> frase positiva so quando nao ha trafego da VS
+    ok = ft.run({"server_port": 16000, "node_port": 15000, "vs_addr": "10.100.1.10",
+                 "node_addr": "192.168.0.9"}, **common)
+    assert ok["resultado"] == ("Nenhum tráfego da VS na janela capturada. "
+                               "Os membros do pool responderam ao SYN."), ok["resultado"]
+    print("OK: mudo -> \"não responde ao SYN\"; responde; recusa (RST); sem tentativas")
 
 
 def test_simplified_parity_with_agent():
@@ -657,7 +828,9 @@ def test_simplified_parity_with_agent():
         assert mine == theirs, (args, mine, theirs)
         assert ft.focus_vs_traffic(packets, *args) == tp.focus_vs_traffic(packets, *args), args
         for extra in ({"detalhes": True}, {"detalhes": True, "stan": "222222"},
-                      {"stan": "111111"}):
+                      {"stan": "111111"},
+                      {"members": [("192.168.0.9", 15000), ("10.100.2.1", 15000)]},
+                      {"members": [(None, 15000)], "detalhes": True}):
             mine = ft.simplified_view(packets, *args, **extra)
             theirs = tp.simplified_view(packets, *args, **extra)
             assert mine == theirs, (args, extra, mine, theirs)
@@ -732,6 +905,8 @@ def main():
     test_parity_with_agent_parser()
     test_run_end_to_end()
     test_simplified_output()
+    test_same_stan_other_vs_and_no_internal_details()
+    test_member_health()
     test_simplified_parity_with_agent()
     test_cli()
     test_py27_lint()
