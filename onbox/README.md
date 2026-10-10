@@ -16,13 +16,32 @@ Entrada (JSON, stdin ou `--request`): todos opcionais
 | `host` | string | só IPv4/IPv6 literal (sem DNS) |
 | `count` | int 1–500 | padrão 100 |
 | `timeout_sec` | int 1–180 | padrão 20 |
+| `vs_addr` | string | IPv4/IPv6 literal da VS. **Não entra no filtro**: só permite, junto de `server_port`, separar na resposta o tráfego da VS das sondas do monitor do pool |
+| `verbose` | bool | `false` (padrão) = resposta simples; `true` = retorno completo, para depurar |
+| `detalhes` | bool | `true` = cada transação traz `campos`, `trajeto`, `saltos`, `rtt_ms` e a resposta inclui `tabela_markdown` |
+| `stan` | string 1–12 dígitos | com `detalhes`, restringe às transações com esse STAN (bit 11) |
 
 Campos desconhecidos são recusados. Saída (JSON): `status` =
 `ok | busy | blocked | invalid | error`.
 
-* `ok`: `command`, `exit_status` (124 se estourou o prazo), `timed_out`, `summary`,
-  `packets` (≤ 200), `packet_count_truncated`, `stderr`, `warnings` — mesmo formato
-  da ferramenta `tcpdump_validate_traffic` do agente.
+* `ok` (**resposta simples**, padrão): só o tráfego da VS pedida —
+  `resultado` (veredito em uma frase), `trafego` (`conexoes`, `pacotes`, `syn`,
+  `syn_ack`, `rst`, `fin`, `mensagens_iso`), `transacoes` (ISO 8583 agrupadas por STAN:
+  `hora`, `stan`, `pedido`, `resposta`, `respondida`, `tipo`, `origem`; até 50),
+  `janela` (`max_s`, `encerrou_por`) e `avisos`. Sem `command`, `stderr` nem pacotes
+  brutos. As sondas do monitor (`tcp_half_open`: SYN/SYN-ACK/RST sem dados e sem
+  handshake completo no lado do node) são **descartadas e contadas em `avisos`** — só
+  quando o lado da VS é identificável (`vs_addr` + `server_port`, ou `server_port` ≠
+  `node_port`); caso contrário nada é descartado e um aviso explica.
+* `ok` com `detalhes: true`: a resposta simples, mais, em cada item de `transacoes`:
+  `campos` (bits 7, 11, 32, 37, 70, 100, 127), `trajeto` (os saltos, em ordem: `hora`,
+  `de`, `para`, `mti`), `saltos` e `rtt_ms` (do 1º pedido à última resposta), e
+  `tabela_markdown` — a tabela `# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio` +
+  observações, pronta para ser apresentada como está. Nunca traz payload bruto. Sem
+  transação com o `stan` pedido: `resultado` avisa e não há tabela.
+* `ok` com `verbose: true`: `command`, `exit_status` (124 se estourou o prazo),
+  `timed_out`, `summary`, `packets` (≤ 200), `packet_count_truncated`, `stderr`,
+  `warnings` — mesmo formato da ferramenta `tcpdump_validate_traffic(verbose=True)`.
 * `busy`: já há `MAX_CONCURRENT_TCPDUMP` (2) capturas; nada é iniciado nem
   interrompido; `retry_after_minutes: 5`.
 * `blocked`: *Capturas na porta TCP 1222 (porta de conexão com a captura RISe)

@@ -108,7 +108,10 @@ def test_validation():
     ok = ft.validate_request({"interface": "any", "server_port": 443, "node_port": "15000",
                               "host": "10.100.2.1", "count": 50, "timeout_sec": 10})
     assert ok == {"interface": "any", "server_port": 443, "node_port": 15000,
-                  "host": "10.100.2.1", "count": 50, "timeout_sec": 10}, ok
+                  "host": "10.100.2.1", "count": 50, "timeout_sec": 10,
+                  "vs_addr": None, "verbose": False, "detalhes": False, "stan": None}, ok
+    assert ft.validate_request({"vs_addr": "10.100.1.10", "verbose": True})["vs_addr"] == \
+        "10.100.1.10"
     assert ft.validate_request({"host": "2001:db8::1"})["host"] == "2001:db8::1"
     defaults = ft.validate_request({})
     assert defaults["count"] == ft.DEFAULT_COUNT and defaults["interface"] == "any"
@@ -134,7 +137,19 @@ def test_validation():
         "count acima": {"count": ft.MAX_COUNT + 1},
         "timeout 0": {"timeout_sec": 0},
         "timeout acima": {"timeout_sec": ft.MAX_TIMEOUT_SEC + 1},
+        "verbose texto": {"verbose": "sim"},
+        "verbose numero": {"verbose": 1},
+        "vs_addr DNS": {"vs_addr": "vs.example.com"},
+        "vs_addr com filtro": {"vs_addr": "10.1.1.1 or port 1222"},
+        "detalhes texto": {"detalhes": "sim"},
+        "stan letras": {"stan": "12a"},
+        "stan vazio": {"stan": ""},
+        "stan bool": {"stan": True},
+        "stan longo": {"stan": "1234567890123"},
+        "stan com filtro": {"stan": "1 or port 1222"},
     }
+    assert ft.validate_request({"stan": 123456, "detalhes": True})["stan"] == "123456"
+    assert ft.validate_request({"stan": " 000123 "})["stan"] == "000123"
     for label, request in invalid.items():
         try:
             ft.validate_request(request)
@@ -292,7 +307,7 @@ def test_parity_with_agent_parser():
     onbox = ft.parse_pcap(pcap(frames))
     assert len(agent) == len(onbox) == len(spec), (len(agent), len(onbox))
 
-    keys = ("src", "dst", "flags", "flags_label", "mti", "bit7", "bit11", "bit32", "bit37",
+    keys = ("src", "dst", "flags", "flags_label", "payload_len", "mti", "bit7", "bit11", "bit32", "bit37",
             "bit70", "bit70_desc", "bit100", "bit127", "is_echo_test", "is_signon",
             "is_signoff", "markers_found")
     for index, (left, right) in enumerate(zip(agent, onbox)):
@@ -366,7 +381,8 @@ def test_run_end_to_end():
     set_scenario(work, pcap=pcap_path, record=record,
                  stderr="tcpdump: listening on any\n3 packets captured\n")
     t0 = time.time()
-    result = ft.run({"node_port": 15000, "host": b, "count": 10, "timeout_sec": 5}, **common)
+    result = ft.run({"node_port": 15000, "host": b, "count": 10, "timeout_sec": 5,
+                     "verbose": True}, **common)
     assert result["status"] == "ok", result
     assert result["exit_status"] == 0 and result["timed_out"] is False, result
     assert result["summary"]["syn"] == 1 and result["summary"]["rst_ack"] == 1, result["summary"]
@@ -388,7 +404,7 @@ def test_run_end_to_end():
     # 3) estouro de prazo -> exit 124, pacotes ja emitidos continuam aproveitados
     set_scenario(work, pcap=pcap_path, sleep=30)
     t0 = time.time()
-    slow = ft.run({"node_port": 15000, "timeout_sec": 1}, **common)
+    slow = ft.run({"node_port": 15000, "timeout_sec": 1, "verbose": True}, **common)
     elapsed = time.time() - t0
     assert slow["status"] == "ok" and slow["exit_status"] == 124 and slow["timed_out"], slow
     assert len(slow["packets"]) == 3 and elapsed < 8, (len(slow["packets"]), elapsed)
@@ -397,9 +413,12 @@ def test_run_end_to_end():
     set_scenario(work, pcap=pcap_path,
                  stderr="WARNING - The recommended number of tmm tcpdump instances (2) "
                         "has been exceeded (2).\n")
-    warned = ft.run({"node_port": 15000}, **common)
+    warned = ft.run({"node_port": 15000, "verbose": True}, **common)
     assert warned["status"] == "ok" and len(warned["warnings"]) == 1, warned
     assert "tmm tcpdump instances" in warned["warnings"][0]
+    simple_warned = ft.run({"node_port": 15000}, **common)
+    assert len(simple_warned["avisos"]) >= 1 and \
+        "tmm tcpdump instances" in simple_warned["avisos"][0], simple_warned
 
     # 4b) falha do proprio tcpdump (interface inexistente, filtro...) -> error, nunca "ok"
     set_scenario(work, stderr="tcpdump: bogus0: No such device exists\n", exit=1)
@@ -439,6 +458,163 @@ def test_run_end_to_end():
                      lock_dir=lock_dir, proc_dir=proc, audit=False)
     assert missing["status"] == "error", missing
     print("OK: feliz / 1222 / timeout 124 / warning TMM / teto / guarda / binario ausente")
+
+
+def _vs_scenario_frames():
+    """Cliente->VS 10.100.1.10:17000 (SNAT 10.100.1.20 -> node 192.168.0.9:15000) com
+    DUAS transacoes (0800 e 0100, ambas respondidas) + 3 sondas do monitor do pool."""
+    client, vs, snat, node = "192.168.0.9", "10.100.1.10", "10.100.1.20", "192.168.0.9"
+    ACK, RST = 0x10, 0x04
+    frames = []
+
+    def add(src, dst, sport, dport, flags, payload=b""):
+        frames.append(eth(ipv4_packet(src, dst, tcp_segment(sport, dport, flags, payload))))
+
+    # handshake nas duas pernas
+    add(client, vs, 50000, 17000, TCP_SYN)
+    add(snat, node, 50000, 15000, TCP_SYN)
+    add(node, snat, 15000, 50000, TCP_SYN_ACK)
+    add(vs, client, 17000, 50000, TCP_SYN_ACK)
+    add(client, vs, 50000, 17000, ACK)
+    add(snat, node, 50000, 15000, ACK)
+    # transacao 0800 (STAN 111111) e 0100 (STAN 222222), nos 4 saltos
+    for req, resp, stan in (("0800", "0810", "111111"), ("0100", "0110", "222222")):
+        nmic = "301" if req == "0800" else "000"
+        add(client, vs, 50000, 17000, TCP_PSH_ACK, iso_payload(req, nmic, bit11=stan))
+        add(snat, node, 50000, 15000, TCP_PSH_ACK, iso_payload(req, nmic, bit11=stan))
+        add(node, snat, 15000, 50000, TCP_PSH_ACK, iso_payload(resp, nmic, bit11=stan))
+        add(vs, client, 17000, 50000, TCP_PSH_ACK, iso_payload(resp, nmic, bit11=stan))
+    # sondas do monitor (tcp_half_open): SYN / SYN-ACK / RST, portas efemeras diferentes
+    for port in (4321, 4322, 4323):
+        add(snat, node, port, 15000, TCP_SYN)
+        add(node, snat, 15000, port, TCP_SYN_ACK)
+        add(snat, node, port, 15000, RST)
+    return frames
+
+
+def test_simplified_output():
+    print("== resposta simples: so o trafego da VS, sem sondas do monitor ==")
+    work = fresh_dir()
+    fake = make_fake(work)
+    proc = fake_proc_dir(work, ["bash"])
+    pcap_path = os.path.join(work, "cap.pcap")
+    with open(pcap_path, "wb") as handle:
+        handle.write(pcap(_vs_scenario_frames()))
+    set_scenario(work, pcap=pcap_path)
+    common = dict(tcpdump_bin=fake, lock_dir=os.path.join(work, "locks"), proc_dir=proc,
+                  audit=False)
+    request = {"server_port": 17000, "node_port": 15000, "host": "192.168.0.9",
+               "vs_addr": "10.100.1.10", "timeout_sec": 5}
+
+    simple = ft.run(request, **common)
+    assert simple["status"] == "ok", simple
+    for noisy in ("command", "packets", "stderr", "summary", "exit_status", "timed_out"):
+        assert noisy not in simple, "resposta simples nao deve trazer %r" % noisy
+    assert sorted(simple) == ["avisos", "janela", "resultado", "status", "trafego",
+                              "transacoes"], sorted(simple)
+    tx = simple["transacoes"]
+    assert [(t["stan"], t["pedido"], t["resposta"], t["respondida"]) for t in tx] == [
+        ("111111", "0800", "0810", True), ("222222", "0100", "0110", True)], tx
+    assert tx[0]["tipo"] == "Echo Test" and tx[0]["origem"] == "192.168.0.9", tx[0]
+    assert tx[1]["tipo"] == "Pedido de autorização", tx[1]
+    assert simple["resultado"] == ("2 transação(ões) ISO 8583 na VS (1×0100, 1×0800): "
+                                   "2 respondida(s), 0 sem resposta."), simple["resultado"]
+    # 3 sondas (9 pacotes) ignoradas; 1 conexao da VS em 2 pernas = 2 fluxos, 14 pacotes
+    assert simple["trafego"]["conexoes"] == 2 and simple["trafego"]["pacotes"] == 14, simple["trafego"]
+    assert simple["trafego"]["syn"] == 2 and simple["trafego"]["syn_ack"] == 2, simple["trafego"]
+    assert simple["trafego"]["rst"] == 0 and simple["trafego"]["mensagens_iso"] == 8
+    assert simple["janela"] == {"max_s": 5, "encerrou_por": "limite de pacotes"}, simple["janela"]
+    assert len(simple["avisos"]) == 1 and "3 sonda(s)" in simple["avisos"][0], simple["avisos"]
+
+    # verbose = retorno completo (inclui as sondas, comando e pacotes brutos)
+    full = ft.run(dict(request, verbose=True), **common)
+    assert full["summary"]["total_packets"] == 23 and len(full["packets"]) == 23, full["summary"]
+    assert "command" in full and "stderr" in full
+
+    # sem como separar a VS (so a porta do node): nada e descartado, e avisa
+    broad = ft.run({"node_port": 15000, "host": "192.168.0.9"}, **common)
+    assert broad["trafego"]["pacotes"] == 23, broad["trafego"]
+    assert any("Não foi possível separar" in a for a in broad["avisos"]), broad["avisos"]
+
+    # portas de VS e node diferentes bastam para separar (sem vs_addr)
+    by_ports = ft.run({"server_port": 17000, "node_port": 15000}, **common)
+    assert by_ports["trafego"]["pacotes"] == 14 and len(by_ports["transacoes"]) == 2, by_ports
+
+    # VS sem nenhuma resposta do node: pedido sem resposta, e SYN sem SYN-ACK
+    only_req = [eth(ipv4_packet("192.168.0.9", "10.100.1.10",
+                                tcp_segment(50001, 17000, TCP_PSH_ACK,
+                                            iso_payload("0800", "301", bit11="333333"))))]
+    unanswered = ft.simplified_view(ft.parse_pcap(pcap(only_req)), 17000, 15000, "10.100.1.10")[0]
+    assert unanswered["transacoes"][0]["respondida"] is False, unanswered
+    assert "1 sem resposta" in unanswered["resultado"] or "0 respondida(s), 1 sem" in \
+        unanswered["resultado"], unanswered["resultado"]
+    syn_only = [eth(ipv4_packet("192.168.0.9", "10.100.1.10", tcp_segment(50002, 17000, TCP_SYN)))]
+    view = ft.simplified_view(ft.parse_pcap(pcap(syn_only)), 17000, 15000, "10.100.1.10")[0]
+    assert "SYN sem nenhum SYN-ACK" in view["resultado"], view["resultado"]
+
+    # detalhes: tabela no padrao pedido + campos ISO, trajeto e RTT por transacao
+    det = ft.run(dict(request, detalhes=True), **common)
+    assert det["status"] == "ok" and "tabela_markdown" in det, det
+    table = det["tabela_markdown"].splitlines()
+    assert table[0] == "**Transações (VS 10.100.1.10:17000)** — 2 respondida(s) de 2", table[0]
+    assert table[2] == "| # | Tipo | STAN | Enviada | Resposta | RTT | Rastreio |", table[2]
+    assert table[3] == "|---|---|---|---|---|---|---|", table[3]
+    row = [c.strip() for c in table[4].strip("|").split("|")]
+    assert row[0:3] == ["1", "0800", "111111"] and row[4] == "0810 / 111111", row
+    assert row[6] == "4/4" and row[5].endswith(" ms"), row
+    assert table[5].startswith("| 2 | 0100 | 222222 | ") and "0110 / 222222" in table[5], table[5]
+    assert any(l.startswith("- **Respondidas:** 2 de 2 (1×0100→0110, 1×0800→0810)") for l in table)
+    assert any(l.startswith("- **RTT:** mín ") for l in table)
+    assert any(l.startswith("- **Rastreio:** 2 de 2 com os 4 saltos") for l in table)
+    first = det["transacoes"][0]
+    assert first["campos"]["bit11"] == "111111" and first["campos"]["bit70"] == "301", first
+    assert first["saltos"] == 4 and len(first["trajeto"]) == 4, first
+    assert [h["mti"] for h in first["trajeto"]] == ["0800", "0800", "0810", "0810"], first
+    assert (first["trajeto"][0]["de"], first["trajeto"][0]["para"]) == \
+        ("192.168.0.9.50000", "10.100.1.10.17000"), first["trajeto"][0]
+    assert first["rtt_ms"] is not None and first["rtt_ms"] >= 0, first
+    for leak in ("payload", "packets", "command"):
+        assert leak not in json.dumps(det), leak
+    # a resposta simples (padrao) continua SEM esses campos
+    assert "campos" not in simple["transacoes"][0] and "tabela_markdown" not in simple
+
+    # filtro por STAN
+    one_tx = ft.run(dict(request, detalhes=True, stan="222222"), **common)
+    assert [t["stan"] for t in one_tx["transacoes"]] == ["222222"], one_tx["transacoes"]
+    assert one_tx["tabela_markdown"].splitlines()[0].endswith("1 respondida(s) de 1")
+    none_tx = ft.run(dict(request, detalhes=True, stan="999999"), **common)
+    assert none_tx["transacoes"] == [] and "tabela_markdown" not in none_tx, none_tx
+    assert none_tx["resultado"] == "Nenhuma transação com STAN 999999 na janela capturada."
+
+    # nada da VS na janela
+    probes_only = [f for f in _vs_scenario_frames()[-9:]]
+    empty = ft.simplified_view(ft.parse_pcap(pcap(probes_only)), 17000, 15000, "10.100.1.10")
+    assert empty[0]["resultado"] == "Nenhum tráfego da VS na janela capturada.", empty
+    assert empty[0]["trafego"]["pacotes"] == 0 and "3 sonda(s)" in empty[1][0], empty
+    print("OK: sem command/packets/stderr; 2 transacoes por STAN; 3 sondas fora; verbose volta tudo")
+
+
+def test_simplified_parity_with_agent():
+    print("== paridade da visao simples com src/tcpdump_parser.py ==")
+    try:
+        from src import tcpdump_parser as tp
+    except ImportError as exc:
+        print("PULADO (rode a partir da raiz do repo com PYTHONPATH=.): %s" % exc)
+        return
+    packets = ft.parse_pcap(pcap(_vs_scenario_frames()))
+    for args in ((17000, 15000, "10.100.1.10"), (17000, 15000, None), (None, 15000, None),
+                 (17000, 17000, None), (17000, None, "10.100.1.10")):
+        mine = ft.simplified_view(packets, *args)
+        theirs = tp.simplified_view(packets, *args)
+        assert mine == theirs, (args, mine, theirs)
+        assert ft.focus_vs_traffic(packets, *args) == tp.focus_vs_traffic(packets, *args), args
+        for extra in ({"detalhes": True}, {"detalhes": True, "stan": "222222"},
+                      {"stan": "111111"}):
+            mine = ft.simplified_view(packets, *args, **extra)
+            theirs = tp.simplified_view(packets, *args, **extra)
+            assert mine == theirs, (args, extra, mine, theirs)
+    print("OK: focus_vs_traffic e simplified_view (inclusive detalhes/stan) identicos nos "
+          "dois parsers")
 
 
 def test_cli():
@@ -507,6 +683,8 @@ def main():
     test_summary()
     test_parity_with_agent_parser()
     test_run_end_to_end()
+    test_simplified_output()
+    test_simplified_parity_with_agent()
     test_cli()
     test_py27_lint()
     print("\nTODOS OS TESTES ON-BOX PASSARAM")
