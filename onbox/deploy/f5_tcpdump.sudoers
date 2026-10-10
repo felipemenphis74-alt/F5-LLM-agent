@@ -1,0 +1,11 @@
+# Instalar como /etc/sudoers.d/f5_tcpdump  (dono root:root, modo 0440).
+# Validar ANTES de ativar:  visudo -c -f /etc/sudoers.d/f5_tcpdump
+#
+# Permite ao usuario do worker iControl LX (restnoded, sem privilegio) executar
+# EXATAMENTE o script de captura como root - e nada mais:
+#   * caminho fixo; o script deve ser root:root 0755 e nao gravavel por restnoded;
+#   * "" no final = o script so pode ser chamado SEM argumentos (o pedido vai por stdin);
+#   * sem shell, sem outros comandos.
+Cmnd_Alias F5_TCPDUMP = /shared/f5_tcpdump/f5_tcpdump.py ""
+
+restnoded ALL=(root) NOPASSWD: F5_TCPDUMP

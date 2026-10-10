@@ -1,0 +1,11 @@
+{
+  "name": "f5_tcpdump",
+  "version": "0.1.0",
+  "description": "Extensao iControl LX: expoe o f5_tcpdump.py (captura tcpdump segura + parsing ISO 8583) por REST em /mgmt/shared/f5_tcpdump",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "nodejs/f5TcpdumpWorker.js",
+  "scripts": {
+    "test": "node test/worker.test.js"
+  }
+}
