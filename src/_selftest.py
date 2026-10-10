@@ -405,9 +405,9 @@ def _security_checks(device, real_client):
     outputs = {
         "list_devices": server.list_devices(),
         "get_virtual_server_status": server.get_virtual_server_status("d", "vs_full_443"),
-        "get_virtual_server_config": server.get_virtual_server_config("d"),
+        "get_virtual_server_config": server.get_virtual_server_config("d", "vs_full_443"),
         "get_pool_status": server.get_pool_status("d", vs_name="vs_full_443"),
-        "get_sys_connections": server.get_sys_connections("d", server_port=17000),
+        "get_sys_connections": server.get_sys_connections("d", "vs_full_443"),
         "tcpdump_validate_traffic": server.tcpdump_validate_traffic(
             "d", server_port=443, node_port=8443, count=10, timeout_sec=5),
         "tcpdump_validate_traffic(detalhes)": server.tcpdump_validate_traffic(
@@ -420,13 +420,103 @@ def _security_checks(device, real_client):
     # os avisos genéricos substituem o texto do TMOS
     assert server.MSG_CONCURRENT in outputs["tcpdump_validate_traffic"]["avisos"]
     # sem filtro, a tabela de conexões não é entregue
-    for call in (lambda: server.get_sys_connections("d"), lambda: server.get_pool_status("d")):
+    for call in (lambda: server.get_pool_status("d", ""),
+                 lambda: server.get_virtual_server_status("d", "   "),
+                 lambda: server.get_virtual_server_config("d", None)):
         try:
             call()
             raise AssertionError("deveria exigir filtro/VS")
         except safety.UnsafeInputError:
             pass
     print("OK: %d respostas sem comando/stderr/host/NTP/ARP/VLAN/autenticação" % len(outputs))
+
+    print("== escopo: perguntar da app2 NUNCA devolve app1/app3 ==")
+    three = SAMPLE_VS_LIST.replace("hydap", "15000").replace("fmsas", "16000")
+
+    class ScopeClient:
+        def __init__(self):
+            self.calls = []
+
+        def list_virtual_server_config(self, vs_name=None):
+            self.calls.append(("list", vs_name))
+            return CommandResult("c", three, "", 0)
+
+        def show_virtual_servers(self, vs_name=None):
+            self.calls.append(("show", vs_name))
+            return CommandResult("c", SAMPLE_VS_STATUS.replace("vs_app1_15000", vs_name or "x")
+                                 .replace("10.100.1.10:15000", "10.100.1.10:16000"), "", 0)
+
+        def show_pool(self, pool_name=None):
+            self.calls.append(("pool", pool_name))
+            return CommandResult("c", SAMPLE_POOL_STATUS, "", 0)
+
+        def show_sys_connections(self, client_addr=None, server_addr=None, server_port=None,
+                                 client_port=None):
+            self.calls.append(("conn", server_addr, server_port))
+            return CommandResult("c", SAMPLE_SYS_CONNECTIONS, "", 0)
+
+    scope_client = ScopeClient()
+    server._client_for = lambda name: scope_client
+    others = ("vs_app1_15000", "vs_app3_17000", "pool_app1_15000", "pool_app3_17000", "zezinho")
+    for asked in ("app 2", "app2", "App-2", "vs_app2_16000"):
+        for label, out in (
+                ("status", server.get_virtual_server_status("d", asked)),
+                ("config", server.get_virtual_server_config("d", asked)),
+                ("pool", server.get_pool_status("d", asked)),
+                ("conexoes", server.get_sys_connections("d", asked))):
+            text = json.dumps(out, ensure_ascii=False)
+            assert "vs_app2_16000" in text or label in ("pool", "conexoes"), (asked, label, text[:200])
+            for other in others:
+                assert other not in text, f"{asked!r} {label}: vazou {other}: {text[:200]}"
+    # a conexao e sempre filtrada pelo IP:porta DA VS (nunca so pelo IP do VIP, compartilhado)
+    assert ("conn", "10.100.1.10", 16000) in scope_client.calls, scope_client.calls
+    assert all(c[0] != "conn" or c[2] == 16000 for c in scope_client.calls), scope_client.calls
+    # sem nome, ou nome ambiguo/inexistente: so uma mensagem para refinar - sem listar VS
+    for bad, expect in (("app", "corresponde a 3 VS"), ("nada disso", "Nenhuma VS corresponde")):
+        try:
+            server.get_virtual_server_config("d", bad)
+            raise AssertionError("deveria recusar " + bad)
+        except safety.UnsafeInputError as exc:
+            assert expect in str(exc), str(exc)
+            for other in others + ("vs_app2_16000", "pool_app2_16000"):
+                assert other not in str(exc), (bad, str(exc))
+    print("OK: 4 grafias de app2 x status/config/pool/conexões: só app2; ambíguo/inexistente "
+          "não lista VS; conexões filtradas por IP:porta da VS")
+
+    print("== escopo: baseline e comparações só da VS pedida ==")
+    rows = [{"vs_name": "vs_app1_15000", "pool_name": "pool_app1_15000", "expected_port": 15000,
+             "purpose": "app1"},
+            {"vs_name": "vs_app2_16000", "pool_name": "pool_app2_16000", "expected_port": 16000,
+             "purpose": "app2"},
+            {"vs_name": "vs_app3_17000", "pool_name": "pool_app3_17000", "expected_port": 17000,
+             "purpose": "app3"}]
+    real_excel, real_sheets = server.baseline_excel.load_baseline, \
+        server.baseline_sheets.load_baseline_from_sheet
+    server.baseline_excel.load_baseline = lambda filename, sheet=None: list(rows)
+    server.baseline_sheets.load_baseline_from_sheet = lambda sid, rng="A1:F1000": list(rows)
+    try:
+        only = server.get_baseline_from_excel("b.xlsx", "app 2")
+        assert [r["vs_name"] for r in only] == ["vs_app2_16000"], only
+        assert [r["vs_name"] for r in server.get_baseline_from_sheets("id", "app 2")] == \
+            ["vs_app2_16000"]
+        diff = server.compare_vs_with_excel_baseline("d", "b.xlsx", "app 2")
+        text = json.dumps(diff)
+        assert [m["vs_name"] for m in diff["matched"]] == ["vs_app2_16000"], diff
+        assert diff["summary"]["total_live"] == 1 and diff["summary"]["total_baseline"] == 1, diff
+        assert diff["unexpected_on_device"] == [] and diff["missing_on_device"] == [], diff
+        for other in ("vs_app1_15000", "vs_app3_17000", "app1", "app3"):
+            assert other not in text, other
+        again = server.compare_vs_with_sheets_baseline("d", "id", "app 2")
+        assert [m["vs_name"] for m in again["matched"]] == ["vs_app2_16000"], again
+        members = server.compare_pool_members_with_baseline(
+            "d", "app 2", ["10.100.2.1:15000", "192.168.0.9:15000"])
+        assert members["vs_name"] == "vs_app2_16000" and "observacao" in members, members
+        assert "recomenda" in members["observacao"] and "não é" in members["observacao"]
+    finally:
+        server.baseline_excel.load_baseline, server.baseline_sheets.load_baseline_from_sheet = \
+            real_excel, real_sheets
+    print("OK: baseline/comparações devolvem só a linha da VS pedida; comparação de membros é "
+          "informativa (sem recomendação)")
 
     print("== segurança: erros chegam ao cliente como mensagem genérica ==")
     errors = (
@@ -448,7 +538,7 @@ def _security_checks(device, real_client):
             raise exc
         server._client_for = boom
         try:
-            server.get_virtual_server_status("d")
+            server.get_virtual_server_status("d", "app 2")
             raise AssertionError(f"deveria falhar: {exc!r}")
         except RuntimeError as raised:
             assert str(raised) == expected, (exc, str(raised))
@@ -496,7 +586,8 @@ def _security_checks(device, real_client):
         # as regras que reforçam a política precisam estar no texto do agente
         for rule in ("Somente leitura", "Confidencialidade", "Nunca invente",
                      "Sem sugestões de configuração", "AD, RADIUS, NTP", "tabela_markdown",
-                     "busy", "não tente de novo"):
+                     "busy", "não tente de novo", "Nunca enumere VS", "vs_name",
+                     "adicionar, remover, substituir"):
             assert rule.lower() in text.lower(), f"agente sem a regra: {rule!r}"
         # toda ferramenta citada na tabela de uso existe de fato
         import re as _re
@@ -858,6 +949,10 @@ def run():
     assert [v["vs_name"] for v in match(vs_all, "Padaria do Zézinho")] == ["vs_app3_17000"]
     assert [v["vs_name"] for v in match(vs_all, "vs_app1_15000")] == ["vs_app1_15000"]
     assert len(match(vs_all, "app")) == 3  # abrangente: casa com várias
+    # palavra solta nao pode puxar as outras: "app 1" -> so a app1 (antes casava as 3)
+    assert [v["vs_name"] for v in match(vs_all, "app 1")] == ["vs_app1_15000"]
+    assert [v["vs_name"] for v in match(vs_all, "App-2")] == ["vs_app2_16000"]
+    assert [v["vs_name"] for v in match(vs_all, "app 3")] == ["vs_app3_17000"]
     assert match(vs_all, "padaria do joaozinho") == [] and match(vs_all, "  ") == []
     print("OK: nome/descrição sem acento e caixa; 'app' -> 3 candidatas; inexistente -> 0")
 
@@ -889,8 +984,6 @@ def run():
         out = server.tcpdump_capture_connection("f5-selftest", broad)
         assert out["status"] == status, out
         assert conn_client.captures == [], "pedido abrangente/inexistente NÃO pode capturar"
-    assert {c["vs_name"] for c in server.tcpdump_capture_connection(
-        "f5-selftest", "app")["candidates"]} == {"vs_app1_15000", "vs_app2_16000", "vs_app3_17000"}
 
     out = server.tcpdump_capture_connection("f5-selftest", "padaria do zezinho",
                                             client_addr="192.168.170.1")
@@ -918,7 +1011,9 @@ def run():
     for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
         assert other not in json.dumps(nf), other
     amb = server.tcpdump_capture_connection("f5-selftest", "app")
-    assert all(set(c) == {"vs_name", "description"} for c in amb["candidates"]), amb
+    assert amb["status"] == "ambiguous" and "candidates" not in amb, amb   # so a contagem
+    for other in ("vs_app1_15000", "vs_app2_16000", "vs_app3_17000", "pool_app"):
+        assert other not in json.dumps(amb), other
     print("OK: 'app' -> ambiguous, sem captura; padaria -> só VS 10.100.1.10:17000 + member "
           "192.168.0.9:15000, sem nenhuma menção a outras VS")
 

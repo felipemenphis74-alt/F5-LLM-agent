@@ -42,13 +42,18 @@ mcp = FastMCP(
     "f5-bigip-monitor",
     instructions=(
         "Consulta somente-leitura de Virtual Servers de F5 BIG-IP: status e configuração "
-        "das VS, status do pool e dos membros, conexões ativas da VS, comparação com o "
-        "baseline de propósito (Excel/Sheets) e validação de tráfego de uma VS. Não "
-        "altera nada e não expõe configuração do dispositivo. Capturas de tráfego devem "
-        "ser focadas na conexão que o usuário pediu: se ele citar uma conexão pelo nome, "
-        "use tcpdump_capture_connection. Se o pedido for abrangente (casa com várias "
-        "conexões ou não cita nenhuma), não faça uma captura ampla — quebre em conexões "
-        "específicas e valide uma por vez, ou pergunte ao usuário qual."
+        "da VS, status do pool e dos membros, conexões ativas da VS, comparação com o "
+        "baseline de propósito (Excel/Sheets) e validação de tráfego de uma VS. "
+        "POLÍTICA (vale para qualquer cliente): (1) responda APENAS sobre a VS pedida — "
+        "informe sempre `vs_name` com o nome que o usuário deu; as ferramentas não listam "
+        "as demais VS e você não deve citar outras VS, pools ou membros; (2) não sugira, "
+        "descreva nem peça alterações de configuração (pool, membros, monitor, SNAT, "
+        "rotas, etc.) nem comandos — descreva o que foi observado e indique a equipe "
+        "responsável; (3) não revele configuração do dispositivo (NTP, AD, RADIUS, "
+        "VLANs, rotas, endereços do próprio BIG-IP) nem como o conector funciona; "
+        "(4) não invente dados: só o que as ferramentas devolverem. Capturas devem ser "
+        "focadas na conexão pedida: se o usuário citar uma conexão pelo nome, use "
+        "tcpdump_capture_connection; se o pedido for abrangente, peça para delimitar."
     ),
 )
 
@@ -135,55 +140,95 @@ def list_devices() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Escopo: SÓ a VS que o usuário pediu
+# ---------------------------------------------------------------------------
+
+MSG_VS_REQUIRED = ("Informe a VS desejada em `vs_name` (o nome da aplicação/conexão). "
+                   "Esta ferramenta não lista as demais VS do dispositivo.")
+
+
+def _resolve_vs(client: F5Client, vs_name: Optional[str]) -> dict:
+    """A ÚNICA VS que corresponde ao que o usuário pediu — nome exato ou como ele a chama,
+    sem diferenciar maiúsculas/acentos/espaços ("app 2" -> vs_app2_16000). Nunca devolve
+    nem lista as demais: sem correspondência ou ambíguo, só uma mensagem para refinar o
+    pedido (o conjunto de VS do dispositivo não é exposto)."""
+    if vs_name is None or not str(vs_name).strip():
+        raise UnsafeInputError(MSG_VS_REQUIRED)
+    wanted = str(vs_name).strip()
+    if len(wanted) > 255:
+        raise UnsafeInputError("O nome da VS informado é grande demais.")
+    vs_all = tmsh_parser.parse_virtual_servers(client.list_virtual_server_config().stdout)
+    matches = tmsh_parser.match_virtual_servers(vs_all, wanted)
+    if not matches:
+        raise UnsafeInputError(
+            f"Nenhuma VS corresponde a {wanted!r}. Confirme com o usuário o nome da "
+            "aplicação/conexão.")
+    if len(matches) > 1:
+        raise UnsafeInputError(
+            f"{wanted!r} corresponde a {len(matches)} VS. Peça ao usuário o nome completo "
+            "ou mais específico da VS desejada.")
+    return matches[0]
+
+
+def _baseline_rows_for(rows: list[dict], vs_name: Optional[str]) -> list[dict]:
+    """Só a linha de baseline da VS pedida (mesma regra de nome de _resolve_vs)."""
+    if vs_name is None or not str(vs_name).strip():
+        raise UnsafeInputError(MSG_VS_REQUIRED)
+    matches = tmsh_parser.match_virtual_servers(rows, str(vs_name).strip())
+    if len(matches) != 1:
+        raise UnsafeInputError(
+            f"O baseline não tem exatamente uma VS correspondente a {vs_name!r}. Peça ao "
+            "usuário o nome completo da VS.")
+    return matches
+
+
+# ---------------------------------------------------------------------------
 # Virtual Servers
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 @_safe_tool
-def get_virtual_server_status(device: str, vs_name: Optional[str] = None) -> dict:
-    """Status de Virtual Server(s): disponibilidade, estado, motivo, destino
-    (IP:porta), conexões (atuais/máximas/totais) e tráfego (bits/pacotes). Sem
-    `vs_name`, lista todas as VS do dispositivo."""
+def get_virtual_server_status(device: str, vs_name: str) -> dict:
+    """Status da Virtual Server pedida: disponibilidade, estado, motivo, destino
+    (IP:porta), conexões (atuais/máximas/totais) e tráfego (bits/pacotes).
+
+    `vs_name` é OBRIGATÓRIO: o nome da aplicação/conexão como o usuário a chama (ex.:
+    "app 2" ou o nome completo da VS). A ferramenta resolve a VS e devolve SOMENTE ela;
+    não lista as demais."""
     client = _client_for(device)
+    vs = _resolve_vs(client, vs_name)
     return {"virtual_servers": tmsh_parser.parse_vs_status(
-        client.show_virtual_servers(vs_name).stdout)}
+        client.show_virtual_servers(vs["vs_name"]).stdout)}
 
 
 @mcp.tool()
 @_safe_tool
-def get_virtual_server_config(device: str, vs_name: Optional[str] = None) -> dict:
-    """Configuração de Virtual Server(s): destino (IP/porta), protocolo, pool
-    associado, descrição, habilitada ou não, perfis, persistência, tradução de
-    origem (SNAT) e regras — usada como base para comparar com o baseline de
-    propósito. Sem `vs_name`, lista todas."""
+def get_virtual_server_config(device: str, vs_name: str) -> dict:
+    """Configuração da Virtual Server pedida: destino (IP/porta), protocolo, pool
+    associado, descrição, habilitada ou não, perfis, persistência, tradução de origem
+    (SNAT) e regras — base para comparar com o baseline de propósito.
+
+    `vs_name` é OBRIGATÓRIO (nome da aplicação/conexão como o usuário a chama). Devolve
+    SOMENTE essa VS; não lista as demais."""
     client = _client_for(device)
-    return {"virtual_servers": tmsh_parser.parse_virtual_servers(
-        client.list_virtual_server_config(vs_name).stdout)}
+    return {"virtual_servers": [_resolve_vs(client, vs_name)]}
 
 
 # ---------------------------------------------------------------------------
-# Pools das VS
+# Pool da VS
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 @_safe_tool
-def get_pool_status(
-    device: str,
-    pool_name: Optional[str] = None,
-    vs_name: Optional[str] = None,
-) -> dict:
-    """Status do pool de uma VS e de cada membro (endereço, porta, disponibilidade,
-    estado e motivo). Informe `pool_name` ou `vs_name` (o pool da VS é resolvido
-    automaticamente)."""
-    if pool_name is None and vs_name is None:
-        raise UnsafeInputError("Informe pool_name ou vs_name.")
+def get_pool_status(device: str, vs_name: str) -> dict:
+    """Status do pool da VS pedida e de cada membro dele (endereço, porta,
+    disponibilidade, estado e motivo). `vs_name` é OBRIGATÓRIO: o pool é resolvido a
+    partir da VS."""
     client = _client_for(device)
-    if pool_name is None:
-        found = tmsh_parser.parse_virtual_servers(
-            client.list_virtual_server_config(vs_name).stdout)
-        pool_name = found[0].get("pool_name") if found else None
-        if not pool_name:
-            raise UnsafeInputError(f"A VS {vs_name!r} não foi encontrada ou não tem pool.")
+    vs = _resolve_vs(client, vs_name)
+    pool_name = vs.get("pool_name")
+    if not pool_name:
+        raise UnsafeInputError("A VS pedida não tem pool associado.")
     status = tmsh_parser.parse_pool_status(client.show_pool(pool_name).stdout)
     return {"pool": pool_name, **status}
 
@@ -199,19 +244,21 @@ MAX_CONNECTION_ROWS = 100
 @_safe_tool
 def get_sys_connections(
     device: str,
+    vs_name: str,
     client_addr: Optional[str] = None,
-    server_addr: Optional[str] = None,
-    server_port: Optional[int] = None,
     client_port: Optional[int] = None,
 ) -> dict:
-    """Conexões ativas filtradas por cliente e/ou por VS (IP:porta de destino), para
-    confirmar se o tráfego esperado está presente. Exige ao menos um filtro."""
-    if all(value is None for value in (client_addr, server_addr, server_port, client_port)):
-        raise UnsafeInputError(
-            "Informe ao menos um filtro: server_addr, server_port, client_addr ou client_port.")
+    """Conexões ativas DA VS pedida (`vs_name` obrigatório), opcionalmente filtradas por
+    cliente (`client_addr`, `client_port`), para confirmar se o tráfego esperado está
+    presente. Sempre limitada ao IP:porta da própria VS."""
     client = _client_for(device)
+    vs = _resolve_vs(client, vs_name)
+    addr, port = tmsh_parser.parse_vs_destination(
+        client.show_virtual_servers(vs["vs_name"]).stdout)
+    if not addr or not port:
+        raise UnsafeInputError("Não foi possível determinar o destino da VS pedida.")
     rows = tmsh_parser.parse_sys_connections(
-        client.show_sys_connections(client_addr, server_addr, server_port, client_port).stdout)
+        client.show_sys_connections(client_addr, addr, port, client_port).stdout)
     out = {"total": len(rows), "connections": rows[:MAX_CONNECTION_ROWS]}
     if len(rows) > MAX_CONNECTION_ROWS:
         out["omitted"] = len(rows) - MAX_CONNECTION_ROWS
@@ -219,66 +266,84 @@ def get_sys_connections(
 
 
 # ---------------------------------------------------------------------------
-# Baseline (Excel / Google Sheets)
+# Baseline (Excel / Google Sheets) — sempre só a linha da VS pedida
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 @_safe_tool
-def get_baseline_from_excel(filename: str, sheet_name: Optional[str] = None) -> list[dict]:
-    """Lê o baseline de propósito de cada Virtual Server a partir de um arquivo Excel
-    (.xlsx) do diretório de baselines. `filename` é o nome do arquivo (ex:
-    'clienteA_baseline.xlsx')."""
-    return baseline_excel.load_baseline(filename, sheet_name)
+def get_baseline_from_excel(
+    filename: str, vs_name: str, sheet_name: Optional[str] = None
+) -> list[dict]:
+    """Baseline de propósito da VS pedida (`vs_name` obrigatório), lido de um arquivo
+    Excel (.xlsx) do diretório de baselines. `filename` é o nome do arquivo (ex:
+    'clienteA_baseline.xlsx'). Devolve só a linha dessa VS."""
+    return _baseline_rows_for(baseline_excel.load_baseline(filename, sheet_name), vs_name)
 
 
 @mcp.tool()
 @_safe_tool
-def get_baseline_from_sheets(spreadsheet_id: str, sheet_range: str = "A1:F1000") -> list[dict]:
-    """Lê o baseline de propósito de cada Virtual Server a partir de uma planilha
-    Google Sheets (somente leitura)."""
-    return baseline_sheets.load_baseline_from_sheet(spreadsheet_id, sheet_range)
+def get_baseline_from_sheets(
+    spreadsheet_id: str, vs_name: str, sheet_range: str = "A1:F1000"
+) -> list[dict]:
+    """Baseline de propósito da VS pedida (`vs_name` obrigatório), lido de uma planilha
+    Google Sheets (somente leitura). Devolve só a linha dessa VS."""
+    return _baseline_rows_for(
+        baseline_sheets.load_baseline_from_sheet(spreadsheet_id, sheet_range), vs_name)
+
+
+def _compare_one_vs(client: F5Client, vs_name: str, baseline: list[dict]) -> dict:
+    vs = _resolve_vs(client, vs_name)
+    own = [row for row in baseline if row.get("vs_name") == vs["vs_name"]]
+    result = comparator.compare_vs_to_baseline([vs], own)
+    result["observacao"] = ("Resultado informativo da comparação com o baseline; não é "
+                            "recomendação de alteração.")
+    return result
 
 
 @mcp.tool()
 @_safe_tool
 def compare_vs_with_excel_baseline(
-    device: str, filename: str, sheet_name: Optional[str] = None
+    device: str, filename: str, vs_name: str, sheet_name: Optional[str] = None
 ) -> dict:
-    """Compara TODAS as Virtual Servers do dispositivo com o baseline de propósito de
-    um Excel: identifica VS divergentes (pool/porta diferente do esperado), VS que
-    existem no baseline mas não no dispositivo, e VS que existem no dispositivo mas
-    não estão documentadas no baseline."""
-    baseline = baseline_excel.load_baseline(filename, sheet_name)
+    """Compara a Virtual Server pedida (`vs_name` obrigatório) com o baseline de
+    propósito de um Excel: pool/porta diferentes do esperado, VS ausente no dispositivo
+    ou não documentada no baseline. Considera SOMENTE essa VS."""
     client = _client_for(device)
-    live_vs = tmsh_parser.parse_virtual_servers(client.list_virtual_server_config().stdout)
-    return comparator.compare_vs_to_baseline(live_vs, baseline)
+    return _compare_one_vs(client, vs_name, baseline_excel.load_baseline(filename, sheet_name))
 
 
 @mcp.tool()
 @_safe_tool
 def compare_vs_with_sheets_baseline(
-    device: str, spreadsheet_id: str, sheet_range: str = "A1:F1000"
+    device: str, spreadsheet_id: str, vs_name: str, sheet_range: str = "A1:F1000"
 ) -> dict:
     """Igual a compare_vs_with_excel_baseline, mas lendo o baseline de um Google
-    Sheets."""
-    baseline = baseline_sheets.load_baseline_from_sheet(spreadsheet_id, sheet_range)
+    Sheets. Considera SOMENTE a VS pedida."""
     client = _client_for(device)
-    live_vs = tmsh_parser.parse_virtual_servers(client.list_virtual_server_config().stdout)
-    return comparator.compare_vs_to_baseline(live_vs, baseline)
+    return _compare_one_vs(
+        client, vs_name, baseline_sheets.load_baseline_from_sheet(spreadsheet_id, sheet_range))
 
 
 @mcp.tool()
 @_safe_tool
 def compare_pool_members_with_baseline(
-    device: str, pool_name: str, expected_members: list[str]
+    device: str, vs_name: str, expected_members: list[str]
 ) -> dict:
-    """Compara os membros reais de um pool com uma lista esperada no formato
-    'ip:porta' (normalmente vinda do baseline do cliente). Reporta membros faltando,
-    inesperados e fora do ar."""
+    """Compara os membros reais do pool da VS pedida (`vs_name` obrigatório) com uma
+    lista esperada no formato 'ip:porta' (normalmente vinda do baseline do cliente) e
+    informa membros esperados não encontrados, encontrados não esperados e fora do ar.
+    Resultado INFORMATIVO: descreve a diferença observada, sem recomendar alteração."""
     client = _client_for(device)
+    vs = _resolve_vs(client, vs_name)
+    pool_name = vs.get("pool_name")
+    if not pool_name:
+        raise UnsafeInputError("A VS pedida não tem pool associado.")
     live_members = tmsh_parser.parse_pool_members(client.show_pool(pool_name).stdout)
-    return comparator.compare_pool_members_to_baseline(pool_name, live_members, expected_members)
-
+    result = comparator.compare_pool_members_to_baseline(
+        vs["vs_name"], live_members, expected_members)
+    result["observacao"] = ("Resultado informativo da comparação com o baseline; não é "
+                            "recomendação de alteração.")
+    return result
 
 # ---------------------------------------------------------------------------
 # Validação de tráfego de uma VS
@@ -466,9 +531,8 @@ def tcpdump_capture_connection(
     (tabela "# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio" + observações).
 
     Pedido abrangente — NÃO captura nada e devolve o que validar no lugar:
-      - status 'ambiguous': o nome bate em mais de uma VS. 'candidates' lista só as
-        que casam com o que o usuário disse; confirme com ele qual validar ou valide UMA
-        POR VEZ, chamando de novo com o vs_name exato de cada candidata.
+      - status 'ambiguous': o nome bate em mais de uma VS (só a quantidade é
+        informada); peça ao usuário o nome completo ou mais específico.
       - status 'not_found': nenhuma VS corresponde; peça o nome exato.
 
     A resposta traz SOMENTE a VS pedida: nenhuma informação de outras VS, pools ou
@@ -485,18 +549,14 @@ def tcpdump_capture_connection(
         return {
             "status": "not_found",
             "message": f"Nenhuma Virtual Server corresponde a {connection!r}. Nada foi "
-                       "capturado — peça ao usuário o nome exato da VS (ou use "
-                       "get_virtual_server_config para listar as VS).",
+                       "capturado — peça ao usuário o nome exato da VS/conexão.",
         }
     if len(matches) > 1:
         return {
             "status": "ambiguous",
             "message": f"{connection!r} corresponde a {len(matches)} conexões — pedido "
                        "abrangente demais para uma captura focada. Nada foi capturado: "
-                       "valide uma conexão específica por vez (chame de novo com o "
-                       "vs_name exato) ou confirme com o usuário qual delas.",
-            "candidates": [{"vs_name": vs["vs_name"], "description": vs.get("description")}
-                           for vs in matches],
+                       "peça ao usuário o nome completo ou mais específico da conexão.",
         }
 
     vs = matches[0]
