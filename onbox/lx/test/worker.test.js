@@ -80,7 +80,12 @@ function loadWorker() {
 function newWorker() {
     var Worker = loadWorker();
     var worker = new Worker();
-    worker.logger = {info: function () {}, error: function () {}, warning: function () {}};
+    worker.logged = [];
+    worker.logger = {
+        info: function (m) { worker.logged.push(m); },
+        error: function (m) { worker.logged.push(m); },
+        warning: function (m) { worker.logged.push(m); }
+    };
     return {worker: worker, Worker: Worker};
 }
 
@@ -187,31 +192,39 @@ test("1222 bloqueada pelo script vira 403 com a mensagem original", function () 
     });
 });
 
-test("saida que nao e JSON -> 500 com stderr resumido", function () {
+var INTERNALS = /sudo|sudoers|restnoded|stderr|stdout|traceback|ENOENT|spawn|codigo=|\/usr|\/shared|script|processo|worker|bytes/i;
+
+test("saida que nao e JSON -> 500 GENERICO; o detalhe so vai para o log interno", function () {
     var w = newWorker().worker;
     nextChildren.push(scriptedChild({stdout: "Traceback (most recent call last)", stderr: "boom\u0007", code: 1}));
     return invoke(w, "Post", {}).then(function (op) {
         assert.strictEqual(op.statusCode, 500);
-        assert.strictEqual(op.body.status, "error");
-        assert.ok(/codigo=1/.test(op.body.message) && /boom\?/.test(op.body.message), op.body.message);
+        assert.deepStrictEqual(op.body, {status: "error",
+            message: "A captura não pôde ser concluída. Tente novamente em alguns minutos."});
+        assert.ok(!INTERNALS.test(JSON.stringify(op.body)), JSON.stringify(op.body));
+        assert.ok(w.logged.some(function (l) { return /codigo=1/.test(l) && /boom\?/.test(l); }),
+            "o detalhe deve ir para o log: " + w.logged.join(" | "));
     });
 });
 
-test("sudo sem regra -> dica de instalacao", function () {
+test("sudo sem regra -> 500 generico (a dica de instalacao fica no log)", function () {
     var w = newWorker().worker;
     nextChildren.push(scriptedChild({stderr: "sudo: a password is required\n", code: 1}));
     return invoke(w, "Post", {}).then(function (op) {
         assert.strictEqual(op.statusCode, 500);
-        assert.ok(/sudoers\.d/.test(op.body.message), op.body.message);
+        assert.ok(!INTERNALS.test(JSON.stringify(op.body)), JSON.stringify(op.body));
+        assert.ok(w.logged.some(function (l) { return /sudoers\.d/.test(l); }), w.logged.join("|"));
     });
 });
 
-test("falha ao iniciar o processo -> 500", function () {
+test("falha ao iniciar o processo -> 500 generico", function () {
     var w = newWorker().worker;
     nextChildren.push(scriptedChild({error: new Error("spawn ENOENT")}));
     return invoke(w, "Post", {}).then(function (op) {
         assert.strictEqual(op.statusCode, 500);
-        assert.ok(/ENOENT/.test(op.body.message));
+        assert.deepStrictEqual(op.body, {status: "error",
+            message: "A captura não está disponível no momento."});
+        assert.ok(w.logged.some(function (l) { return /ENOENT/.test(l); }), w.logged.join("|"));
     });
 });
 
@@ -247,6 +260,7 @@ test("prazo duro: SIGTERM, depois SIGKILL, resposta 504", function () {
     return invoke(made.worker, "Post", {timeout_sec: 1}).then(function (op) {
         assert.strictEqual(op.statusCode, 504);
         assert.strictEqual(op.body.status, "error");
+        assert.ok(!INTERNALS.test(JSON.stringify(op.body)), JSON.stringify(op.body));
         assert.strictEqual(child.signals[0], "SIGTERM");
         return new Promise(function (resolve) { setTimeout(resolve, 80); }).then(function () {
             assert.deepStrictEqual(child.signals, ["SIGTERM", "SIGKILL"]);
@@ -266,6 +280,7 @@ test("limite de processos simultaneos -> 429 sem iniciar outro", function () {
     return invoke(made.worker, "Post", {}).then(function (third) {
         assert.strictEqual(third.statusCode, 429);
         assert.strictEqual(third.body.status, "busy");
+        assert.ok(!INTERNALS.test(JSON.stringify(third.body)), JSON.stringify(third.body));
         assert.strictEqual(spawnCalls.length, 2);
         return Promise.all([a, b]);
     }).then(function (done) {
@@ -386,8 +401,16 @@ test("resposta rapida (busy/invalid) continua sincrona e nao deixa job guardado"
         return invoke(w, "Get");
     }).then(function (info) {
         assert.strictEqual(info.statusCode, 200);
-        assert.strictEqual(info.body.jobs.stored, 0);
+        assert.strictEqual(Object.keys(w.jobs).length, 0);   // nenhum job guardado
+        // a interface de captura e o modo verbose nao existem para o cliente
+        assert.ok(info.body.fields.indexOf("interface") === -1, info.body.fields);
+        assert.ok(info.body.fields.indexOf("verbose") === -1, info.body.fields);
+        assert.ok(info.body.fields.indexOf("detalhes") !== -1, info.body.fields);
         assert.strictEqual(info.body.async.max_timeout_sec, 180);
+        // o descritor nao expoe estado interno do worker nem a mecanica
+        assert.strictEqual(info.body.jobs, undefined);
+        assert.strictEqual(info.body.async.fast_window_ms, undefined);
+        assert.ok(!INTERNALS.test(JSON.stringify(info.body.description)), info.body.description);
     });
 });
 
@@ -396,6 +419,7 @@ test("id desconhecido -> 404, id malformado ou vazio -> 400, nada e executado", 
     return poll(w, new Array(33).join("a")).then(function (op) {
         assert.strictEqual(op.statusCode, 404);
         assert.strictEqual(op.body.status, "not_found");
+        assert.ok(!INTERNALS.test(JSON.stringify(op.body)), JSON.stringify(op.body));
         return poll(w, "../etc/passwd");
     }).then(function (op) {
         assert.strictEqual(op.statusCode, 400);
@@ -445,7 +469,7 @@ test("maxJobs: guarda so os concluidos mais recentes", function () {
     return chain.then(function () {
         return invoke(w, "Get");     // dispara a limpeza
     }).then(function (info) {
-        assert.strictEqual(info.body.jobs.stored, 2);
+        assert.strictEqual(Object.keys(w.jobs).length, 2);   // so os 2 concluidos mais novos
         return poll(w, ids[0]);
     }).then(function (op) {
         assert.strictEqual(op.statusCode, 404);

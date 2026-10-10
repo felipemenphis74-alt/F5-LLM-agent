@@ -38,6 +38,13 @@ class UnsafeInputError(ValueError):
     """Levantado quando um parâmetro de entrada falha na validação de segurança."""
 
 
+class CommandNotAllowedError(UnsafeInputError):
+    """Levantado quando um comando JÁ MONTADO fica fora da allowlist (bug interno ou
+    tentativa de bypass). Diferente de UnsafeInputError "de entrada": a mensagem cita o
+    comando e NUNCA deve chegar ao cliente da ferramenta — o servidor MCP a troca por
+    uma resposta genérica."""
+
+
 def require_identifier(value: str, field_name: str) -> str:
     if not is_valid_identifier(value):
         raise UnsafeInputError(
@@ -63,16 +70,17 @@ def require_port(value, field_name: str) -> int:
     return int(value)
 
 
-# Prefixos de comando tmsh explicitamente permitidos (somente leitura).
-# Qualquer comando final tem que começar com um destes.
+# Prefixos de comando tmsh explicitamente permitidos (somente leitura). Só o que
+# descreve Virtual Servers, seus pools e as conexões delas — nada da configuração do
+# dispositivo (NTP, ARP, VLANs, autenticação, rede, sistema...). Qualquer comando final
+# tem que ser exatamente um destes ou começar com um deles seguido de espaço (então
+# "list ltm virtual-address" NÃO casa com "list ltm virtual").
 ALLOWED_TMSH_PREFIXES = (
     "show ltm virtual",
     "show ltm pool",
     "list ltm virtual",
     "list ltm pool",
     "show sys connection",
-    "show ltm virtual-address",
-    "show net vlan",
 )
 
 # Palavras que NUNCA podem aparecer em um comando enviado ao F5, mesmo dentro
@@ -94,18 +102,19 @@ def assert_safe_tmsh_command(command: str) -> str:
     lowered = normalized.lower()
 
     if not normalized.startswith("tmsh "):
-        raise UnsafeInputError(f"Comando deve começar com 'tmsh ': {normalized!r}")
+        raise CommandNotAllowedError(f"Comando deve começar com 'tmsh ': {normalized!r}")
 
     body = normalized[len("tmsh "):].strip()
 
-    if not any(body.startswith(prefix) for prefix in ALLOWED_TMSH_PREFIXES):
-        raise UnsafeInputError(
+    if not any(body == prefix or body.startswith(prefix + " ")
+               for prefix in ALLOWED_TMSH_PREFIXES):
+        raise CommandNotAllowedError(
             f"Comando tmsh fora da allowlist read-only: {normalized!r}"
         )
 
     for token in FORBIDDEN_TOKENS:
         if token in lowered:
-            raise UnsafeInputError(
+            raise CommandNotAllowedError(
                 f"Comando contém token proibido {token!r}: {normalized!r}"
             )
 
@@ -156,7 +165,7 @@ def _assert_no_blocked_ports(normalized: str, lowered: str) -> None:
         if not token.isdigit():
             # só geramos portas decimais; qualquer outra forma (nome de serviço,
             # hex...) não dá para comparar com a lista de bloqueio -> recusa.
-            raise UnsafeInputError(
+            raise CommandNotAllowedError(
                 f"Porta em formato não suportado no filtro tcpdump {token!r}: {normalized!r}"
             )
         if int(token) in BLOCKED_TCPDUMP_PORTS:
@@ -173,14 +182,14 @@ def assert_safe_tcpdump_command(command: str) -> str:
     """Valida um comando tcpdump já montado a partir de template fixo."""
     normalized = command.strip()
     if not normalized.startswith("tcpdump "):
-        raise UnsafeInputError(f"Comando deve começar com 'tcpdump ': {normalized!r}")
+        raise CommandNotAllowedError(f"Comando deve começar com 'tcpdump ': {normalized!r}")
 
     lowered = normalized.lower()
     # tcpdump é somente captura/leitura por natureza; ainda assim bloqueamos
     # tentativas de encadear comandos via shell.
     for token in (";", "&&", "|", "`", "$(", ">", ">>"):
         if token in lowered:
-            raise UnsafeInputError(
+            raise CommandNotAllowedError(
                 f"Comando tcpdump contém token proibido {token!r}: {normalized!r}"
             )
 
@@ -202,5 +211,5 @@ def assert_safe_ps_command(command: str) -> str:
     capturas tcpdump já estão rodando antes de iniciar uma nova."""
     normalized = command.strip()
     if normalized not in ALLOWED_PS_COMMANDS:
-        raise UnsafeInputError(f"Comando ps fora do esperado: {normalized!r}")
+        raise CommandNotAllowedError(f"Comando ps fora do esperado: {normalized!r}")
     return normalized

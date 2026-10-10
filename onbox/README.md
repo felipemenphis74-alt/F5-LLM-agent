@@ -11,50 +11,66 @@ Entrada (JSON, stdin ou `--request`): todos opcionais
 
 | campo | tipo | observação |
 |---|---|---|
-| `interface` | string | `any` por padrão; só `[A-Za-z0-9_.-]`, sem `-` inicial |
 | `server_port`, `node_port` | int 1–65535 | **1222 é bloqueada** |
 | `host` | string | só IPv4/IPv6 literal (sem DNS) |
 | `count` | int 1–500 | padrão 100 |
 | `timeout_sec` | int 1–180 | padrão 20 |
-| `vs_addr` | string | IPv4/IPv6 literal da VS. Com `server_port`, a perna do cliente vira `port <server_port> and host <vs_addr>` e a resposta separa o tráfego da VS (descarta sondas do monitor e conexões de outra VS no mesmo IP) |
+| `vs_addr` | string | IPv4/IPv6 literal da VS. Com `server_port`, a perna do cliente vira `port <server_port> and host <vs_addr>` e a resposta separa o tráfego da VS |
 | `client_addr` | string | IPv4/IPv6 literal do cliente; exige `server_port`. Acrescenta `and host <client_addr>` à perna do cliente |
 | `node_addr` | string | IPv4/IPv6 literal do pool member; exige `node_port`. Perna do servidor vira `port <node_port> and host <node_addr>` |
-
-Filtro com IP por perna: `(port 17000 and host 10.100.1.10 [and host <cliente>]) or (port 15000 and host 192.168.0.9)`.
-`host` (legado) continua fazendo AND com o filtro inteiro. Mesmo com o filtro por perna, um
-member usado por várias VS traz a perna do servidor das outras: a resposta mantém só as
-conexões do node ligadas à VS (mesmo STAN ou mesma porta efêmera do cliente) e avisa
-quantas de outra VS foram ignoradas.
-| `verbose` | bool | `false` (padrão) = resposta simples; `true` = retorno completo, para depurar |
 | `detalhes` | bool | `true` = cada transação traz `campos`, `trajeto`, `saltos`, `rtt_ms` e a resposta inclui `tabela_markdown` |
 | `stan` | string 1–12 dígitos | com `detalhes`, restringe às transações com esse STAN (bit 11) |
 
-Campos desconhecidos são recusados. Saída (JSON): `status` =
-`ok | busy | blocked | invalid | error`.
+A interface de captura é **fixa** (não é parâmetro do cliente) e não existe modo
+`verbose`: `interface` e `verbose` são recusados como parâmetros não suportados.
 
-* `ok` (**resposta simples**, padrão): só o tráfego da VS pedida —
-  `resultado` (veredito em uma frase), `trafego` (`conexoes`, `pacotes`, `syn`,
+Filtro com IP por perna: `(port 17000 and host 10.100.1.10 [and host <cliente>]) or (port 15000 and host 192.168.0.9)`.
+`host` (legado) continua fazendo AND com o filtro inteiro.
+
+### Só a VS pedida
+
+Mesmo com o filtro por perna, um member usado por várias VS traz a perna do servidor das
+outras. A resposta mantém **só** o tráfego da VS pedida e **não menciona** o que foi
+descartado (sondas do monitor do pool, conexões de outra VS):
+
+* o lado cliente é o que passa pelo IP:porta da VS;
+* uma perna do node só fica se for de uma conexão dessa VS — mesmo STAN **e** mesmo
+  MTI **dentro de 2 s** da mensagem na VS, ou mesma porta efêmera do cliente (o F5 a
+  preserva no SNAT) com a conexão começando em até 2 s. Um STAN repetido em outra VS,
+  noutro instante, não entra;
+* só descarta quando o lado da VS é identificável (`vs_addr` + `server_port`, ou
+  `server_port` ≠ `node_port`); caso contrário nada é descartado e um aviso explica.
+
+### Saída
+
+`status` = `ok | busy | blocked | invalid | error`. **Nenhuma resposta traz comando,
+`stderr`, código de saída, caminhos, nome do host, nem detalhe de como a captura
+funciona**; falhas voltam como mensagem genérica (o detalhe vai para o syslog, tag
+`f5_tcpdump`).
+
+* `ok`: `resultado` (veredito em uma frase), `trafego` (`conexoes`, `pacotes`, `syn`,
   `syn_ack`, `rst`, `fin`, `mensagens_iso`), `transacoes` (ISO 8583 agrupadas por STAN:
   `hora`, `stan`, `pedido`, `resposta`, `respondida`, `tipo`, `origem`; até 50),
-  `janela` (`max_s`, `encerrou_por`) e `avisos`. Sem `command`, `stderr` nem pacotes
-  brutos. As sondas do monitor (`tcp_half_open`: SYN/SYN-ACK/RST sem dados e sem
-  handshake completo no lado do node) são **descartadas e contadas em `avisos`** — só
-  quando o lado da VS é identificável (`vs_addr` + `server_port`, ou `server_port` ≠
-  `node_port`); caso contrário nada é descartado e um aviso explica.
+  `janela` (`max_s`, `encerrou_por`) e `avisos`.
+* `membros` (quando há `node_port` + IP do node, ou portas de VS e node diferentes): como
+  cada membro do pool **da VS pedida** respondeu às aberturas de conexão vistas na
+  captura (sondas do monitor + conexões da VS): `responde ao SYN`, `não responde ao SYN
+  (sem SYN-ACK)`, `recusa a conexão (RST)` ou `sem tentativas de abertura na janela`, com
+  `syn`/`syn_ack`/`rst`. É a análise de "node fora do ar" e entra no `resultado`
+  (ex.: *Membro 10.100.2.1:15000 não responde ao SYN (sem SYN-ACK) (4 SYN, 0 SYN-ACK).*).
+  As sondas em si não são listadas, e nada sobre outras VS.
 * `ok` com `detalhes: true`: a resposta simples, mais, em cada item de `transacoes`:
   `campos` (bits 7, 11, 32, 37, 70, 100, 127), `trajeto` (os saltos, em ordem: `hora`,
   `de`, `para`, `mti`), `saltos` e `rtt_ms` (do 1º pedido à última resposta), e
   `tabela_markdown` — a tabela `# | Tipo | STAN | Enviada | Resposta | RTT | Rastreio` +
   observações, pronta para ser apresentada como está. Nunca traz payload bruto. Sem
   transação com o `stan` pedido: `resultado` avisa e não há tabela.
-* `ok` com `verbose: true`: `command`, `exit_status` (124 se estourou o prazo),
-  `timed_out`, `summary`, `packets` (≤ 200), `packet_count_truncated`, `stderr`,
-  `warnings` — mesmo formato da ferramenta `tcpdump_validate_traffic(verbose=True)`.
-* `busy`: já há `MAX_CONCURRENT_TCPDUMP` (2) capturas; nada é iniciado nem
-  interrompido; `retry_after_minutes: 5`.
+* `busy`: há capturas em andamento; nada é iniciado nem interrompido;
+  `retry_after_minutes: 5` (mensagem genérica, sem contagem nem nome do host).
 * `blocked`: *Capturas na porta TCP 1222 (porta de conexão com a captura RISe)
   estão desabilitadas para esta ferramenta.*
-
+* `error`: *A captura não pôde ser concluída…* / *…não está disponível no momento.* —
+  sem stderr nem causa.
 ## O que muda em relação ao agente via SSH
 
 * `tcpdump` é executado com **lista de argumentos** (sem shell) e `--` antes do filtro.
@@ -105,7 +121,8 @@ paralelo, com tráfego ISO 8583 rastreado pelos 4 saltos por STAN.
 | `deploy/f5_tcpdump.sudoers` | regra única para `restnoded` executar só o script |
 
 O worker é só transporte — a validação e a safety (1222, limites, trava) continuam
-no `f5_tcpdump.py`. Mapeamento `status` → HTTP: `ok` 200, `invalid` 400, `blocked`
+no `f5_tcpdump.py`; as mensagens ao cliente são genéricas (stderr, sudo e erros de
+execução vão só para o log interno do restnoded). Mapeamento `status` → HTTP: `ok` 200, `invalid` 400, `blocked`
 403, `busy` 429, `error` 500; prazo estourado 504. No máximo 4 processos simultâneos
 por worker, corpo ≤ 2 KB, saída ≤ 4 MB, sem shell.
 
@@ -119,7 +136,7 @@ síncrona de 180 s duplicava a captura e ocupava as vagas do guard. Por isso:
 |---|---|
 | `POST /mgmt/shared/f5_tcpdump` (corpo JSON) | espera até 2 s. Se o script já terminou (`invalid`/`blocked`/`busy`/erro, ou captura curta): **a resposta de sempre** (200/400/403/429/500). Senão: **202** `{status:"running", job_id, poll, max_sec}` |
 | `GET /mgmt/shared/f5_tcpdump?job_id=<id>` | **202** `running` enquanto roda; depois o **mesmo JSON e o mesmo código HTTP** que o POST síncrono teria devolvido, acrescido de `job_id`, `started_at`, `finished_at`; **404** id desconhecido; **400** id malformado |
-| `GET /mgmt/shared/f5_tcpdump` | descritor (campos, limites, `jobs.running/stored`) — não executa nada |
+| `GET /mgmt/shared/f5_tcpdump` | descritor (campos, limites) — não executa nada |
 
 * O id vai em **query string**: o `restjavad` só encaminha o caminho exato registrado
   (`/shared/f5_tcpdump/<id>` volta 404 "Public URI path not registered").

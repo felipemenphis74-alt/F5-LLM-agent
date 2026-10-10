@@ -52,6 +52,17 @@ var CONFIG = {
     maxJobs: 50                // jobs guardados (concluidos mais antigos saem primeiro)
 };
 
+// Mensagens que chegam ao cliente da API: nenhuma cita metodo, comando, usuario do worker,
+// regra de sudo, stderr ou texto vindo do equipamento (o detalhe vai para o log interno).
+var MSG = {
+    unavailable: "A captura não está disponível no momento.",
+    failed: "A captura não pôde ser concluída. Tente novamente em alguns minutos.",
+    timeout: "A captura excedeu o tempo máximo. Tente novamente com uma janela menor.",
+    busy: "Há capturas demais em andamento; tente novamente em instantes.",
+    notFound: "Captura desconhecida ou expirada.",
+    tooBig: "O resultado da captura é grande demais. Reduza a janela ou o filtro."
+};
+
 var JOB_ID_RE = /^[0-9a-f]{32}$/;
 var BASE_PATH = "/mgmt/shared/f5_tcpdump";
 
@@ -89,21 +100,19 @@ F5TcpdumpWorker.prototype.onGet = function (restOperation) {
     this._purgeJobs();
     this._reply(restOperation, 200, {
         name: "f5_tcpdump",
-        description: "Captura tcpdump segura + parsing ISO 8583 (somente leitura)",
+        description: "Validação de tráfego de uma VS (somente leitura)",
         usage: "POST neste caminho com um objeto JSON; se a captura demorar, a resposta " +
             "e 202 com job_id e o resultado sai em GET " + BASE_PATH + "?job_id=<job_id>",
-        fields: ["interface", "server_port", "node_port", "host", "count", "timeout_sec",
-            "vs_addr", "client_addr", "node_addr", "verbose", "detalhes", "stan"],
+        fields: ["server_port", "node_port", "host", "count", "timeout_sec", "vs_addr",
+            "client_addr", "node_addr", "detalhes", "stan"],
         status_values: Object.keys(HTTP_BY_STATUS),
         http_status: HTTP_BY_STATUS,
         async: {
-            fast_window_ms: CONFIG.fastWindowMs,
             accepted_http: 202,
             running_status: "running",
             result_ttl_sec: CONFIG.jobTtlSec,
             max_timeout_sec: CONFIG.maxTimeoutSec
         },
-        jobs: {running: this.inFlight, stored: Object.keys(this.jobs).length}
     });
 };
 
@@ -117,8 +126,7 @@ F5TcpdumpWorker.prototype._getJob = function (restOperation, id) {
     if (!job) {
         this._reply(restOperation, 404, {
             status: "not_found",
-            message: "Captura desconhecida: o resultado expirou (" + CONFIG.jobTtlSec +
-                " s depois de concluir) ou o restnoded reiniciou.",
+            message: MSG.notFound,
             job_id: id
         });
         return;
@@ -197,7 +205,7 @@ F5TcpdumpWorker.prototype.onPost = function (restOperation) {
     if (self.inFlight >= CONFIG.maxInFlight) {
         self._reply(restOperation, 429, {
             status: "busy",
-            message: "Muitas capturas em andamento neste worker; tente novamente em instantes.",
+            message: MSG.busy,
             retry_after_minutes: 1
         });
         return;
@@ -226,7 +234,9 @@ F5TcpdumpWorker.prototype.onPost = function (restOperation) {
         }
     }, CONFIG.fastWindowMs);
 
-    runScript(payload, limitMs, function (result, httpOverride) {
+    runScript(payload, limitMs, function (detail) {
+        self._log("warning", detail);     // so no log interno do restnoded
+    }, function (result, httpOverride) {
         self.inFlight -= 1;
         var httpStatus = httpOverride || HTTP_BY_STATUS[result.status] || 500;
         job.state = "done";
@@ -344,7 +354,7 @@ function sudoHint(stderr) {
  * exatamente uma vez. Prazo duro: timeout_sec + margem; ao estourar manda SIGTERM
  * (o sudo repassa ao script) e depois SIGKILL.
  */
-function runScript(payload, limitMs, callback) {
+function runScript(payload, limitMs, detailLog, callback) {
     var finished = false;
     var stdout = "";
     var stderr = "";
@@ -362,8 +372,8 @@ function runScript(payload, limitMs, callback) {
                 child.kill("SIGKILL");
             } catch (err) { /* ja terminou */ }
         }, CONFIG.killGraceMs);
-        finish(errorResult("Prazo excedido (" + Math.round(limitMs / 1000) +
-            " s) aguardando o script."), 504);
+        detailLog("prazo excedido (" + Math.round(limitMs / 1000) + " s) aguardando o script");
+        finish(errorResult(MSG.timeout), 504);
     }, limitMs);
 
     function finish(result, httpOverride) {
@@ -379,12 +389,14 @@ function runScript(payload, limitMs, callback) {
         child = childProcess.spawn(CONFIG.sudoPath, ["-n", CONFIG.scriptPath],
             {stdio: ["pipe", "pipe", "pipe"]});
     } catch (err) {
-        finish(errorResult("Falha ao iniciar o script: " + err.message));
+        detailLog("falha ao iniciar o script: " + err.message);
+        finish(errorResult(MSG.unavailable));
         return;
     }
 
     child.on("error", function (err) {
-        finish(errorResult("Falha ao iniciar o script: " + err.message));
+        detailLog("falha ao iniciar o script: " + err.message);
+        finish(errorResult(MSG.unavailable));
     });
 
     child.stdout.on("data", function (chunk) {
@@ -410,7 +422,8 @@ function runScript(payload, limitMs, callback) {
             clearTimeout(killTimer);
         }
         if (tooBig) {
-            finish(errorResult("Saida do script acima de " + CONFIG.maxOutputBytes + " bytes."));
+            detailLog("saida do script acima de " + CONFIG.maxOutputBytes + " bytes");
+            finish(errorResult(MSG.tooBig));
             return;
         }
         var parsed = parseResult(stdout);
@@ -419,9 +432,10 @@ function runScript(payload, limitMs, callback) {
             return;
         }
         var detail = tail(stderr, 300);
-        finish(errorResult("Saida inesperada do script (codigo=" + code +
-            (signal ? ", sinal=" + signal : "") + ")." + (detail ? " stderr: " + detail : "") +
-            sudoHint(stderr)));
+        detailLog("saida inesperada do script (codigo=" + code +
+            (signal ? ", sinal=" + signal : "") + ")" + (detail ? " stderr: " + detail : "") +
+            sudoHint(stderr));
+        finish(errorResult(MSG.failed));
     });
 
     child.stdin.on("error", function () { /* EPIPE se o filho morrer antes de ler */ });
