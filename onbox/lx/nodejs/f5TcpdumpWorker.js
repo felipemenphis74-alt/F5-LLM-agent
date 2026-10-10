@@ -43,7 +43,7 @@ var CONFIG = {
     maxOutputBytes: 4 * 1024 * 1024,
     maxStderrBytes: 4096,
     maxInFlight: 4,            // processos simultaneos deste worker
-    defaultTimeoutSec: 20,     // espelha o f5_tcpdump.py
+    defaultTimeoutSec: 60,     // espelha DEFAULT_TIMEOUT_SEC do f5_tcpdump.py
     maxTimeoutSec: 180,        // espelha MAX_TIMEOUT_SEC do f5_tcpdump.py
     deadlineMarginSec: 15,     // folga alem do timeout_sec do pedido
     killGraceMs: 3000,
@@ -103,7 +103,7 @@ F5TcpdumpWorker.prototype.onGet = function (restOperation) {
         description: "Validação de tráfego de uma VS (somente leitura)",
         usage: "POST neste caminho com um objeto JSON; se a captura demorar, a resposta " +
             "e 202 com job_id e o resultado sai em GET " + BASE_PATH + "?job_id=<job_id>",
-        fields: ["server_port", "node_port", "host", "count", "timeout_sec", "vs_addr",
+        fields: ["server_port", "node_port", "host", "count", "timeout_sec", "members", "vs_addr",
             "client_addr", "node_addr", "detalhes", "stan"],
         status_values: Object.keys(HTTP_BY_STATUS),
         http_status: HTTP_BY_STATUS,

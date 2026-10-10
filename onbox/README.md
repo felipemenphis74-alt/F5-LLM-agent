@@ -1,8 +1,8 @@
 # onbox — captura tcpdump + safety + parsing ISO 8583 dentro do BIG-IP
 
-`f5_tcpdump.py` junta num único arquivo o que o agente MCP faz hoje em três
-lugares (captura via SSH, `safety.py`, `tcpdump_parser.py`), para rodar **no
-equipamento** e ser exposto por uma API (iControl LX). Só biblioteca padrão e
+`f5_tcpdump.py` reúne num único arquivo a captura, a safety e o parsing ISO 8583,
+para rodar **no equipamento** e ser exposto por uma API (iControl LX). É o **único**
+caminho de captura do agente MCP (o MCP não executa tcpdump por SSH). Só biblioteca padrão e
 escrito para Python **2.7 e 3.x** (o Python do TMOS pode ser 2.7).
 
 ## Contrato
@@ -14,7 +14,7 @@ Entrada (JSON, stdin ou `--request`): todos opcionais
 | `server_port`, `node_port` | int 1–65535 | **1222 é bloqueada** |
 | `host` | string | só IPv4/IPv6 literal (sem DNS) |
 | `count` | int 1–500 | padrão 100 |
-| `timeout_sec` | int 1–180 | padrão 20 |
+| `timeout_sec` | int 1–180 | padrão **60** |
 | `vs_addr` | string | IPv4/IPv6 literal da VS. Com `server_port`, a perna do cliente vira `port <server_port> and host <vs_addr>` e a resposta separa o tráfego da VS |
 | `client_addr` | string | IPv4/IPv6 literal do cliente; exige `server_port`. Acrescenta `and host <client_addr>` à perna do cliente |
 | `node_addr` | string | IPv4/IPv6 literal do pool member; exige `node_port`. Perna do servidor vira `port <node_port> and host <node_addr>` |
@@ -86,8 +86,9 @@ funciona**; falhas voltam como mensagem genérica (o detalhe vai para o syslog, 
 PYTHONPATH=. python onbox/test_f5_tcpdump.py
 ```
 
-Inclui paridade campo a campo com `src/tcpdump_parser.py` e um `tcpdump` falso
-para o caminho `run()` completo.
+Inclui um `tcpdump` falso para o caminho `run()` completo. O agente MCP é testado em
+`python -m src._selftest` (`src/onbox_client.py` + ferramentas de captura contra uma API
+simulada).
 
 ## Validado no BIG-IP 17.0.0.2 (CentOS 7.3 base)
 

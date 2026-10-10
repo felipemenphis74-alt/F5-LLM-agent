@@ -5,7 +5,7 @@ Rodar (Python 3, a partir da raiz do repo):
     PYTHONPATH=. python onbox/test_f5_tcpdump.py
 
 Cobre: validacao/safety, parsing de pcap (Ethernet/SLL/SLL2/VLAN/IPv6/opcoes TCP/
-truncado), paridade com o parser de texto do agente (src/tcpdump_parser.py),
+truncado), visao simples por VS/membro,
 caminho completo run() com um `tcpdump` falso, concorrencia, CLI e um lint de
 compatibilidade com Python 2.7.
 """
@@ -113,7 +113,7 @@ def test_validation():
     print("== validacao / safety ==")
     ok = ft.validate_request({"server_port": 443, "node_port": "15000",
                               "host": "10.100.2.1", "count": 50, "timeout_sec": 10})
-    assert ok == {"interface": "any", "server_port": 443, "node_port": 15000,
+    assert ok == {"interface": "any", "server_port": 443, "node_port": 15000, "members": [],
                   "host": "10.100.2.1", "count": 50, "timeout_sec": 10,
                   "vs_addr": None, "client_addr": None, "node_addr": None,
                   "detalhes": False, "stan": None}, ok
@@ -311,45 +311,6 @@ def test_summary():
     assert (summary["echo_tests"], summary["signon"], summary["signoff"]) == (2, 1, 0), summary
     assert summary["request_0800_count"] == 2 and summary["response_0810_count"] == 1, summary
     print("OK:", summary)
-
-
-def test_parity_with_agent_parser():
-    print("== paridade com src/tcpdump_parser.py (parser de texto do agente) ==")
-    try:
-        from src import _selftest as st
-        from src import tcpdump_parser as tp
-    except ImportError as exc:
-        print("PULADO (rode a partir da raiz do repo com PYTHONPATH=.): %s" % exc)
-        return
-
-    a, b = "10.1.1.5", "10.1.1.10"
-    spec = [  # src, dst, sport, dport, flag_txt, flags, payload
-        (a, b, 51000, 443, "S", TCP_SYN, b""),
-        (b, a, 443, 51000, "S.", TCP_SYN_ACK, b""),
-        (a, b, 51000, 443, "P.", TCP_PSH_ACK, iso_payload("0800", "301")),
-        (b, a, 443, 51000, "P.", TCP_PSH_ACK, iso_payload("0810", "301")),
-        (a, b, 51000, 443, "P.", TCP_PSH_ACK, iso_payload("0800", "001", bit11="000124")),
-        (a, b, 40000, 22, "P.", TCP_PSH_ACK, b"SSH-2.0-OpenSSH_7.4\r\n"),
-        (a, b, 40001, 9000, "P.", TCP_PSH_ACK, b"xx0800yy"),
-        (b, a, 443, 51000, "R.", TCP_RST_ACK, b""),
-    ]
-    text, frames = "", []
-    for index, (src, dst, sport, dport, flag_txt, flags, payload) in enumerate(spec):
-        text += st._entry("14:01:%02d.000000" % index, src, sport, dst, dport, flag_txt, flags, payload)
-        frames.append(eth(st._build_ipv4_tcp_packet(src, dst, sport, dport, flags, payload)))
-
-    agent = tp.parse_tcpdump_output(text)
-    onbox = ft.parse_pcap(pcap(frames))
-    assert len(agent) == len(onbox) == len(spec), (len(agent), len(onbox))
-
-    keys = ("src", "dst", "flags", "flags_label", "payload_len", "mti", "bit7", "bit11", "bit32", "bit37",
-            "bit70", "bit70_desc", "bit100", "bit127", "is_echo_test", "is_signon",
-            "is_signoff", "markers_found")
-    for index, (left, right) in enumerate(zip(agent, onbox)):
-        for key in keys:
-            assert left[key] == right[key], (index, key, left[key], right[key])
-    assert tp.summarize(agent) == ft.summarize(onbox), (tp.summarize(agent), ft.summarize(onbox))
-    print("OK: %d pacotes - todos os campos e o summarize identicos aos do agente" % len(spec))
 
 
 FAKE_TCPDUMP = """#!/usr/bin/env python3
@@ -813,29 +774,72 @@ def test_member_health():
     print("OK: mudo -> \"não responde ao SYN\"; responde; recusa (RST); sem tentativas")
 
 
-def test_simplified_parity_with_agent():
-    print("== paridade da visao simples com src/tcpdump_parser.py ==")
+def test_members_and_default_window():
+    print("== janela padrao 60 s (ate 180) e varios membros do pool ==")
+    assert ft.DEFAULT_TIMEOUT_SEC == 60 and ft.MAX_TIMEOUT_SEC == 180
+    assert ft.validate_request({})["timeout_sec"] == 60
+    assert ft.validate_request({"timeout_sec": 180})["timeout_sec"] == 180
     try:
-        from src import tcpdump_parser as tp
-    except ImportError as exc:
-        print("PULADO (rode a partir da raiz do repo com PYTHONPATH=.): %s" % exc)
-        return
-    packets = ft.parse_pcap(pcap(_vs_scenario_frames() + _shared_vs_frames()))
-    for args in ((17000, 15000, "10.100.1.10"), (17000, 15000, None), (None, 15000, None),
-                 (17000, 17000, None), (17000, None, "10.100.1.10")):
-        mine = ft.simplified_view(packets, *args)
-        theirs = tp.simplified_view(packets, *args)
-        assert mine == theirs, (args, mine, theirs)
-        assert ft.focus_vs_traffic(packets, *args) == tp.focus_vs_traffic(packets, *args), args
-        for extra in ({"detalhes": True}, {"detalhes": True, "stan": "222222"},
-                      {"stan": "111111"},
-                      {"members": [("192.168.0.9", 15000), ("10.100.2.1", 15000)]},
-                      {"members": [(None, 15000)], "detalhes": True}):
-            mine = ft.simplified_view(packets, *args, **extra)
-            theirs = tp.simplified_view(packets, *args, **extra)
-            assert mine == theirs, (args, extra, mine, theirs)
-    print("OK: focus_vs_traffic e simplified_view (inclusive detalhes/stan) identicos nos "
-          "dois parsers")
+        ft.validate_request({"timeout_sec": 181})
+        raise AssertionError("181 s deveria ser recusado")
+    except ft.RequestError as exc:
+        assert exc.status == "invalid", exc.status
+
+    params = ft.validate_request({
+        "server_port": 15000, "vs_addr": "10.100.1.10",
+        "members": [{"addr": "10.100.2.1", "port": 15000},
+                    {"addr": "192.168.0.9", "port": "15000"},
+                    {"addr": "192.168.0.9", "port": 15000}]})        # repetido: 1 so
+    assert params["members"] == [("10.100.2.1", 15000), ("192.168.0.9", 15000)], params
+    argv = ft.build_argv(params, "t")
+    assert argv[argv.index("--") + 1:] == [
+        "(", "(", "port", "15000", "and", "host", "10.100.1.10", ")",
+        "or", "(", "port", "15000", "and", "host", "10.100.2.1", ")",
+        "or", "(", "port", "15000", "and", "host", "192.168.0.9", ")", ")"], argv
+
+    bad = {
+        "members nao e lista": {"members": "10.1.1.1:15000"},
+        "item sem port": {"members": [{"addr": "10.1.1.1"}]},
+        "item com chave extra": {"members": [{"addr": "10.1.1.1", "port": 1, "x": 1}]},
+        "addr nao e IP": {"members": [{"addr": "srv.example.com", "port": 15000}]},
+        "mais de 8": {"members": [{"addr": "10.1.1.%d" % n, "port": 15000} for n in range(9)]},
+        "porta invalida": {"members": [{"addr": "10.1.1.1", "port": 0}]},
+    }
+    for label, request in bad.items():
+        try:
+            ft.validate_request(request)
+            raise AssertionError("deveria recusar: " + label)
+        except ft.RequestError as exc:
+            assert exc.status == "invalid", (label, exc.status)
+    try:                                   # a 1222 vale tambem para os membros
+        ft.validate_request({"members": [{"addr": "10.1.1.1", "port": 1222}]})
+        raise AssertionError("1222 em members deveria ser bloqueada")
+    except ft.RequestError as exc:
+        assert exc.status == "blocked" and exc.message == BLOCKED_MESSAGE, exc.message
+
+    # ponta a ponta: um pool com 3 membros (mudo, saudavel, recusa) - a captura cobre os 3
+    work = fresh_dir()
+    fake = make_fake(work)
+    proc = fake_proc_dir(work, ["bash"])
+    pcap_path = os.path.join(work, "cap.pcap")
+    record = os.path.join(work, "argv.json")
+    with open(pcap_path, "wb") as handle:
+        handle.write(pcap(_member_frames()))
+    set_scenario(work, pcap=pcap_path, record=record)
+    common = dict(tcpdump_bin=fake, lock_dir=os.path.join(work, "locks"), proc_dir=proc,
+                  audit=False)
+    out = ft.run({"server_port": 17000, "vs_addr": "10.100.1.10", "members": [
+        {"addr": "10.100.2.1", "port": 15000}, {"addr": "192.168.0.9", "port": 15000},
+        {"addr": "10.100.3.1", "port": 15000}]}, **common)
+    assert out["status"] == "ok", out
+    assert out["janela"]["max_s"] == 60, out["janela"]          # padrao
+    assert [(m["membro"], m["situacao"]) for m in out["membros"]] == [
+        ("10.100.2.1:15000", "não responde ao SYN (sem SYN-ACK)"),
+        ("192.168.0.9:15000", "responde ao SYN"),
+        ("10.100.3.1:15000", "recusa a conexão (RST)")], out["membros"]
+    assert "Membro 10.100.2.1:15000 não responde" in out["resultado"], out["resultado"]
+    assert "Membro 10.100.3.1:15000 recusa" in out["resultado"], out["resultado"]
+    print("OK: padrao 60 s / teto 180 s; filtro com uma perna por membro; saude de 3 membros")
 
 
 def test_cli():
@@ -902,12 +906,11 @@ def main():
     test_build_argv()
     test_pcap_parsing()
     test_summary()
-    test_parity_with_agent_parser()
     test_run_end_to_end()
     test_simplified_output()
     test_same_stan_other_vs_and_no_internal_details()
     test_member_health()
-    test_simplified_parity_with_agent()
+    test_members_and_default_window()
     test_cli()
     test_py27_lint()
     print("\nTODOS OS TESTES ON-BOX PASSARAM")

@@ -11,7 +11,7 @@ Junta o que hoje esta espalhado pelo agente MCP:
                atomica (flock + contagem de tcpdump em /proc) - nunca interrompe
                capturas existentes;
   * parsing  : pcap -> IPv4/IPv6 -> TCP -> MTI e bits ISO 8583, mesmo formato de
-               saida do agente (src/tcpdump_parser.py).
+               saida devolvida ao agente MCP (unico parser: este arquivo).
 
 Requisitos: SOMENTE biblioteca padrao e compativel com Python 2.7 e 3.x (o Python do
 TMOS pode ser 2.7): sem f-strings, dataclasses, typing nem anotacoes.
@@ -21,8 +21,9 @@ Uso:
         | python f5_tcpdump.py
     python f5_tcpdump.py --request '{"node_port": 15000}'
 
-Entrada (JSON): server_port, node_port, host, vs_addr, client_addr, node_addr, count,
-timeout_sec (e detalhes, stan). A interface de captura NAO e parametro do cliente.
+Entrada (JSON): server_port, node_port, host, vs_addr, client_addr, node_addr, members
+([{addr, port}], ate 8 membros do pool), count, timeout_sec (padrao 60, ate 180), detalhes,
+stan. A interface de captura NAO e parametro do cliente.
 Saida (JSON): status = ok | busy | blocked | invalid | error. A resposta traz SO a VS
 pedida e NUNCA comando, stderr, codigo de saida nem detalhe de como a captura funciona:
 falhas voltam como mensagem generica (o detalhe vai para o syslog, tag f5_tcpdump).
@@ -58,7 +59,7 @@ TCPDUMP_CANDIDATES = ("/usr/sbin/tcpdump", "/sbin/tcpdump", "/usr/bin/tcpdump")
 MAX_COUNT = 500
 MAX_TIMEOUT_SEC = 180
 DEFAULT_COUNT = 100
-DEFAULT_TIMEOUT_SEC = 20
+DEFAULT_TIMEOUT_SEC = 60         # janela padrao; o cliente pode estender ate MAX_TIMEOUT_SEC (180)
 SNAPLEN = 512                    # cobre cabecalhos + os 94 bytes de ISO 8583
 MAX_PACKETS_RETURNED = 200
 
@@ -72,7 +73,8 @@ BLOCKED_PORTS = {
     1222: "porta de conexão com a captura RISe",
 }
 
-ALLOWED_KEYS = ("server_port", "node_port", "host", "count", "timeout_sec",
+MAX_MEMBERS = 8                  # membros do pool por pedido
+ALLOWED_KEYS = ("server_port", "node_port", "host", "count", "timeout_sec", "members",
                 "vs_addr", "client_addr", "node_addr", "detalhes", "stan")
 CAPTURE_INTERFACE = "any"        # fixa: a escolha de interface/VLAN nao e do cliente
 
@@ -234,6 +236,25 @@ def validate_request(request):
     server_port = None if server_port is None else _to_port(server_port, "server_port")
     node_port = None if node_port is None else _to_port(node_port, "node_port")
 
+    # membros do pool da VS: [{"addr": "10.0.0.5", "port": 15000}, ...]. Portas primeiro
+    # tambem aqui: a 1222 e recusada antes de qualquer outra coisa.
+    members = []
+    raw_members = request.get("members")
+    if raw_members is not None:
+        if not isinstance(raw_members, list) or len(raw_members) > MAX_MEMBERS:
+            raise RequestError("invalid", "'members' deve ser uma lista de até %d itens "
+                                          "{addr, port}." % MAX_MEMBERS)
+        for item in raw_members:
+            if not isinstance(item, dict) or "port" not in item or \
+                    set(item) - set(("addr", "port")):
+                raise RequestError("invalid", "Cada item de 'members' deve ter 'port' e, "
+                                              "opcionalmente, 'addr'.")
+            port = _to_port(item["port"], "members.port")
+            addr = item.get("addr")
+            addr = None if addr is None else _to_ip(addr, "members.addr")
+            if (addr, port) not in members:
+                members.append((addr, port))
+
     host = request.get("host")
     host = None if host is None else _to_ip(host, "host")
 
@@ -268,7 +289,7 @@ def validate_request(request):
 
     return {
         "interface": CAPTURE_INTERFACE, "server_port": server_port, "node_port": node_port,
-        "host": host, "count": count, "timeout_sec": timeout_sec,
+        "members": members, "host": host, "count": count, "timeout_sec": timeout_sec,
         "vs_addr": vs_addr, "client_addr": client_addr, "node_addr": node_addr,
         "detalhes": detalhes, "stan": stan,
     }
@@ -293,11 +314,15 @@ def build_argv(params, tcpdump_bin):
         node_leg = _leg(params["node_port"], params["node_addr"])
         if node_leg not in legs:
             legs.append(node_leg)
+    for addr, port in params["members"]:
+        member_leg = _leg(port, addr)
+        if member_leg not in legs:
+            legs.append(member_leg)
 
     terms = []
     if len(legs) == 1:
         terms.append(legs[0])
-    elif len(legs) == 2:
+    elif len(legs) >= 2:
         joined = ["("]
         for index, leg in enumerate(legs):
             if index:
@@ -329,6 +354,10 @@ def _assert_argv_safe(argv, params):
         return
     keywords = ("(", ")", "port", "or", "and", "host")
     allowed_values = set(str(p) for p in (params["server_port"], params["node_port"]) if p)
+    for addr, port in params["members"]:
+        allowed_values.add(str(port))
+        if addr:
+            allowed_values.add(addr)
     for key in ("host", "vs_addr", "client_addr", "node_addr"):
         if params[key]:
             allowed_values.add(params[key])
@@ -696,8 +725,8 @@ def summarize(packets):
 # ---------------------------------------------------------------------------
 # Visao do usuario: so o trafego da VS pedida + transacoes (resposta enxuta)
 # ---------------------------------------------------------------------------
-# ATENCAO: copia de src/tcpdump_parser.py (focus_vs_traffic / build_transactions /
-# simplified_view); test_f5_tcpdump.py confere a paridade. Altere os dois juntos.
+# Visao simples (focus_vs_traffic / build_transactions / simplified_view): e a UNICA
+# implementacao; o agente MCP so repassa o resultado desta API.
 
 PROBE_LABELS = ("SYN", "SYN-ACK", "RST", "RST-ACK")
 
@@ -1118,14 +1147,20 @@ def _run(request, tcpdump_bin, lock_dir, proc_dir, guard_wait_sec):
     # membro do pool a analisar: o IP do node (node_addr ou host) com node_port; so pela
     # porta quando as portas da VS e do node diferem. Mesma porta e sem IP: nao separa.
     node_ip = params["node_addr"] or params["host"]
-    if params["node_port"] is not None and node_ip:
+    if params["members"]:
+        members = list(params["members"])
+    elif params["node_port"] is not None and node_ip:
         members = [(node_ip, params["node_port"])]
     elif params["node_port"] is not None and params["node_port"] != params["server_port"]:
         members = [(None, params["node_port"])]
     else:
         members = None
+    # a separacao VS x node precisa de uma porta de node: com `members`, usa a do primeiro
+    node_port = params["node_port"]
+    if node_port is None and params["members"]:
+        node_port = params["members"][0][1]
     view, notes = simplified_view(
-        packets, server_port=params["server_port"], node_port=params["node_port"],
+        packets, server_port=params["server_port"], node_port=node_port,
         vs_addr=params["vs_addr"], detalhes=params["detalhes"], stan=params["stan"],
         members=members)
     simple = {
