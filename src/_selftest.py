@@ -478,6 +478,33 @@ def _security_checks(device, real_client):
     instructions = server.mcp.instructions or ""
     for term in banned:
         assert term not in instructions.lower(), f"instructions cita {term!r}"
+
+    print("== agente de IA (agent/f5-bigip-assistant.md): ferramentas e regras batem com o MCP ==")
+    import pathlib
+    agent_file = pathlib.Path(__file__).resolve().parent.parent / "agent" / "f5-bigip-assistant.md"
+    if not agent_file.exists():
+        print("PULADO (arquivo do agente não está na imagem; rode a partir do repositório)")
+    else:
+        text = agent_file.read_text(encoding="utf-8")
+        front = text.split("---")[1]
+        listed = {t.strip() for line in front.splitlines() if line.startswith("tools:")
+                  for t in line[len("tools:"):].split(",")}
+        expected = {f"mcp__f5-bigip-monitor__{t.name}" for t in tools}
+        assert listed == expected, (sorted(listed ^ expected))
+        # só ferramentas do conector: nenhuma de escrita/execução no front-matter
+        assert not any(w in front for w in ("Bash", "Write", "Edit", "PowerShell")), front
+        # as regras que reforçam a política precisam estar no texto do agente
+        for rule in ("Somente leitura", "Confidencialidade", "Nunca invente",
+                     "Sem sugestões de configuração", "AD, RADIUS, NTP", "tabela_markdown",
+                     "busy", "não tente de novo"):
+            assert rule.lower() in text.lower(), f"agente sem a regra: {rule!r}"
+        # toda ferramenta citada na tabela de uso existe de fato
+        import re as _re
+        cited = set(_re.findall(r"`(get_[a-z_]+|compare_[a-z_]+|tcpdump_[a-z_]+|list_devices)", text))
+        real = {t.name for t in tools}
+        assert cited and all(c in real or any(r.startswith(c) for r in real)   # citacao com curinga (compare_vs_with_*)
+                             for c in cited), sorted(cited - real)
+        print("OK: %d ferramentas listadas == MCP; regras de segurança presentes" % len(listed))
     print("OK: %d ferramentas sem termos de método/credencial; sem parâmetros interface/verbose"
           % len(tools))
 
