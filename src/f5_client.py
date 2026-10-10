@@ -8,6 +8,7 @@ livre vindo do chamador de fora deste módulo — os métodos públicos são par
 from __future__ import annotations
 
 import shlex
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +22,7 @@ from .safety import (
     assert_safe_tmsh_command,
     require_capturable_port,
     require_identifier,
+    require_ip,
     require_port,
 )
 
@@ -39,6 +41,11 @@ TCPDUMP_BUSY_RETRY_MINUTES = 5
 # diferente de processos tcpdump em userland/`ps`). Quando aparece, é reportado como
 # warning explícito pro chamador, mesmo que a captura em si tenha rodado.
 TMM_TCPDUMP_WARNING_MARKER = "tmm tcpdump instances"
+
+# Prefixo fixo que impõe o prazo duro da captura sem criar um segundo processo:
+# `perl -e 'alarm(N), exec(tcpdump ...)'` — o perl vira o próprio tcpdump (exec) e o
+# alarme pendente o encerra ao fim do prazo. Constante: nunca recebe entrada externa.
+TCPDUMP_DEADLINE_WRAPPER = "perl -e 'alarm(shift), exec(@ARGV)'"
 
 
 def describe_tcpdump_warnings(stderr: str) -> list[str]:
@@ -219,6 +226,10 @@ class F5Client:
         timeout_sec: int,
         max_timeout_sec: int,
         host: Optional[str] = None,
+        client_addr: Optional[str] = None,
+        vs_addr: Optional[str] = None,
+        node_addr: Optional[str] = None,
+        node_members: Optional[list[tuple[str, int]]] = None,
     ) -> CommandResult:
         require_identifier(interface, "interface")
         if count < 1 or count > max_count:
@@ -229,17 +240,45 @@ class F5Client:
             )
         if host is not None:
             require_identifier(host, "host")
+        for value, name in ((client_addr, "client_addr"), (vs_addr, "vs_addr"),
+                            (node_addr, "node_addr")):
+            if value is not None:
+                require_ip(value, name)
+        for member_addr, member_port in node_members or ():
+            require_ip(member_addr, "node_members.address")
+            require_capturable_port(member_port, "node_members.port")
 
         # Portas proibidas (safety.BLOCKED_TCPDUMP_PORTS, ex: 1222 = conexão com a
         # captura RISe): recusadas AQUI, antes de qualquer conexão SSH — uma captura
         # pedida explicitamente nessas portas nunca chega nem a consultar o F5.
-        port_filters = []
         if server_port is not None:
             require_capturable_port(server_port, "server_port")
-            port_filters.append(f"port {int(server_port)}")
         if node_port is not None:
             require_capturable_port(node_port, "node_port")
-            port_filters.append(f"port {int(node_port)}")
+
+        # Cada "perna" da conexão vira um filtro próprio, com IP E porta juntos
+        # (AND): lado cliente = cliente <-> VS:server_port; lado servidor =
+        # F5 <-> node:node_port. Com IP e porta confirmados, a captura pega só
+        # aquela conexão — não qualquer tráfego que use a mesma porta (ex: o
+        # monitor de outros pools ou outra VS no mesmo número de porta).
+        client_leg = []
+        if server_port is not None:
+            client_leg.append(f"port {int(server_port)}")
+        if vs_addr is not None:
+            client_leg.append(f"host {vs_addr}")
+        if client_addr is not None:
+            client_leg.append(f"host {client_addr}")
+        node_leg = []
+        if node_port is not None:
+            node_leg.append(f"port {int(node_port)}")
+        if node_addr is not None:
+            node_leg.append(f"host {node_addr}")
+        # node_members: um lado servidor por pool member (IP E porta de cada um),
+        # para uma VS cujo pool tem mais de um member.
+        member_legs = [[f"port {int(port)}", f"host {addr}"] for addr, port in node_members or ()]
+        port_filters = [" and ".join(leg) for leg in (client_leg, node_leg, *member_legs) if leg]
+        if len(port_filters) > 1:
+            port_filters = [f"({leg})" if " and " in leg else leg for leg in port_filters]
 
         # Guarda de concorrência: nunca deixa o TOTAL de capturas simultâneas (as que
         # já existem + esta que estamos prestes a iniciar) passar de
@@ -256,7 +295,7 @@ class F5Client:
                 f"~{TCPDUMP_BUSY_RETRY_MINUTES} minutos."
             )
 
-        # Filtros de porta se combinam por OR entre si; o filtro de host (quando
+        # As pernas se combinam por OR entre si; o filtro `host` legado (quando
         # informado) sempre AND com o resto, para afunilar a captura a um device
         # específico em vez de qualquer tráfego que passe pela(s) porta(s).
         filter_terms = []
@@ -269,11 +308,12 @@ class F5Client:
         filter_expr = " and ".join(filter_terms)
 
         # -nn: sem resolução de nomes/portas (mais rápido, sem depender de DNS)
+        # -l: saída linha a linha — o prazo duro (abaixo) encerra o tcpdump por sinal,
+        #     sem chance de esvaziar buffer; com -l nada do que já saiu se perde
         # -X: hex+ascii do payload, necessário para localizar marcadores 0800/0810
         # -c: limite duro de pacotes (proteção contra captura sem fim)
-        # timeout do lado do cliente SSH (self.command_timeout_sec) + `timeout`
-        # remoto garantem que a captura não fica presa mesmo sem atingir -c.
-        cmd_parts = ["tcpdump", "-nn", "-X", "-i", shlex.quote(interface), "-c", str(int(count))]
+        cmd_parts = ["tcpdump", "-nn", "-l", "-X", "-i", shlex.quote(interface),
+                     "-c", str(int(count))]
         if filter_expr:
             # O filtro BPF vai como UM argumento, entre aspas: sem isso o shell remoto
             # recusa os parenteses de "(port A or port B)" (erro de sintaxe, exit 1).
@@ -281,15 +321,26 @@ class F5Client:
         tcpdump_cmd = " ".join(cmd_parts)
         assert_safe_tcpdump_command(tcpdump_cmd)
 
-        # `timeout N <cmd>` é um utilitário padrão do shell (coreutils), não do tmsh;
-        # está disponível no bash do TMOS. Isso garante que a captura nunca ultrapassa
-        # o limite mesmo se -c não for atingido (ex: pouco tráfego).
-        full_cmd = f"timeout {int(timeout_sec)} {tcpdump_cmd}"
+        # Prazo duro SEM processo extra no F5: o perl arma um alarm(N) e faz exec do
+        # tcpdump no MESMO processo — o alarme sobrevive ao exec e, vencido, o kernel
+        # encerra o tcpdump (SIGALRM). Uma solicitação = UM processo tcpdump no `ps`.
+        # (O `timeout N tcpdump ...` usado antes deixava o `timeout` como pai, com
+        # "tcpdump" na linha de comando: no `ps` pareciam duas capturas.)
+        full_cmd = f"{TCPDUMP_DEADLINE_WRAPPER} {int(timeout_sec)} {tcpdump_cmd}"
 
         prev_timeout = self.command_timeout_sec
+        started = time.monotonic()
         try:
-            # margem de alguns segundos além do timeout do próprio tcpdump remoto
+            # margem de alguns segundos além do prazo do próprio tcpdump remoto
             self.command_timeout_sec = timeout_sec + 10
-            return self._run(full_cmd)
+            result = self._run(full_cmd)
         finally:
             self.command_timeout_sec = prev_timeout
+
+        # Encerrado pelo alarme o processo não devolve exit status (o paramiko dá
+        # -1). Se isso aconteceu ao fim do prazo, é o prazo duro — normaliza para
+        # 124, o mesmo código que o `timeout` usava. -1 antes do prazo continua -1
+        # (morto por outro motivo) e vira erro para quem chamou.
+        if result.exit_status == -1 and time.monotonic() - started >= timeout_sec - 0.5:
+            result.exit_status = 124
+        return result
