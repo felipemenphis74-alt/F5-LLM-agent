@@ -112,6 +112,9 @@ def test_validation():
     assert ft.validate_request({"host": "2001:db8::1"})["host"] == "2001:db8::1"
     defaults = ft.validate_request({})
     assert defaults["count"] == ft.DEFAULT_COUNT and defaults["interface"] == "any"
+    # teto de captura: 180 s (o padrao do pedido continua curto)
+    assert ft.MAX_TIMEOUT_SEC == 180 and defaults["timeout_sec"] == ft.DEFAULT_TIMEOUT_SEC
+    assert ft.validate_request({"timeout_sec": 180})["timeout_sec"] == 180
 
     invalid = {
         "chave desconhecida": {"nodeport": 1},

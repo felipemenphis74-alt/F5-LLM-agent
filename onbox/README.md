@@ -15,7 +15,7 @@ Entrada (JSON, stdin ou `--request`): todos opcionais
 | `server_port`, `node_port` | int 1–65535 | **1222 é bloqueada** |
 | `host` | string | só IPv4/IPv6 literal (sem DNS) |
 | `count` | int 1–500 | padrão 100 |
-| `timeout_sec` | int 1–60 | padrão 20 |
+| `timeout_sec` | int 1–180 | padrão 20 |
 
 Campos desconhecidos são recusados. Saída (JSON): `status` =
 `ok | busy | blocked | invalid | error`.

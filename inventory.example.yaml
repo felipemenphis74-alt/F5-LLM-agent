@@ -33,4 +33,4 @@ defaults:
   ssh_connect_timeout_sec: 10
   command_timeout_sec: 20
   tcpdump_max_count: 500          # limite duro de pacotes por captura (proteção de carga)
-  tcpdump_max_duration_sec: 60    # limite duro de duração por captura
+  tcpdump_max_duration_sec: 180   # limite duro de duração por captura
