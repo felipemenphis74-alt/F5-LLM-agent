@@ -37,6 +37,8 @@ em profundidade — o controle de acesso definitivo é o RBAC do próprio F5.
 f5-mcp-agent/
 ├── Dockerfile
 ├── docker-compose.yml          # conveniência para build/test local
+├── run.sh                      # partida sem Docker (venv; ex.: Windows + WSL) — veja docs/wsl.md
+├── wsl/                        # exemplos de configuração do Claude e do .wslconfig para WSL
 ├── requirements.txt
 ├── inventory.example.yaml      # copie para inventory.yaml e edite
 ├── .env.example                 # copie para .env e edite
@@ -55,6 +57,10 @@ f5-mcp-agent/
     ├── comparator.py             # diff baseline x estado real
     └── _selftest.py              # auto-testes sem depender de F5 real
 ```
+
+> **Sem Docker Desktop?** O agente também roda direto num venv Python, por exemplo no
+> Windows com WSL2, iniciado pelo [`run.sh`](run.sh). Passo a passo (instalação, rede,
+> known_hosts, configuração do Claude via `wsl.exe`) em [docs/wsl.md](docs/wsl.md).
 
 ## 1. Pré-requisitos no lado do F5
 
@@ -169,6 +175,8 @@ O parsing do `tmsh` é "melhor esforço": a formatação varia por versão de TM
 ```bash
 docker run --rm --entrypoint python f5-mcp-agent:latest -m src._selftest
 ```
+
+Sem Docker (venv): `.venv/bin/python -m src._selftest`.
 
 Isso roda os parsers do `tmsh`, os guardrails de segurança e as ferramentas de captura
 contra uma API de captura simulada (nenhuma conexão de rede é feita). O parsing de

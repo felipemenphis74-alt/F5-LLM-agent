@@ -1,0 +1,7 @@
+# Copie para %UserProfile%\.wslconfig (no Windows) e rode `wsl --shutdown`.
+# Necessário quando a máquina usa VPN/proxy corporativo e o WSL (modo NAT padrão)
+# não alcança a rede de gerência do F5. Requer Windows 11 22H2 ou mais novo.
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+autoProxy=true
